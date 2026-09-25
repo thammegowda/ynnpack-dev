@@ -11,6 +11,7 @@
 // front.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 #include "ynnpack/base/test/tensor.h"
 #include "ynnpack/base/type.h"
+#include "ynnpack/composites/composites.h"
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/subgraph/runtime.h"
 #include "ynnpack/subgraph/test/scheduler.h"
@@ -209,6 +211,111 @@ TEST_F(LoopFusionTest, TwoDotsShareLoops) {
   for (size_t i = 0; i < M; ++i) {
     for (size_t j = 0; j < N; ++j) {
       ASSERT_EQ(out({i, j}), 3.0f * K) << i << " " << j;
+    }
+  }
+}
+
+TEST_F(LoopFusionTest, FeedForwardUsesBoundedScratch) {
+  const size_t rows = 128, hidden = 64, intermediate = 4096, output_width = 32;
+  const size_t tile_size = 2048;
+  const size_t num_tiles = intermediate / tile_size;
+  for (const bool gated : {false, true}) {
+    SCOPED_TRACE(gated ? "gated" : "plain");
+    Tensor<float> input({rows, hidden});
+    Tensor<int8_t> gate_weight({num_tiles, hidden, tile_size});
+    Tensor<float> gate_scale({num_tiles, tile_size, 1});
+    Tensor<int8_t> up_weight({num_tiles, hidden, tile_size});
+    Tensor<float> up_scale({num_tiles, tile_size, 1});
+    Tensor<int8_t> down_weight({num_tiles, tile_size, output_width});
+    Tensor<float> down_scale({output_width, 1});
+    Tensor<float> output({rows, output_width});
+    input.fill(1.0f);
+    gate_weight.fill(1);
+    gate_scale.fill(1.0f / hidden);
+    up_weight.fill(1);
+    up_scale.fill(1.0f / hidden);
+    down_weight.fill(1);
+    down_scale.fill(1.0f / intermediate);
+
+    const uint32_t input_id = 0, output_id = 1;
+    std::vector<uint32_t> gate_weight_ids(num_tiles, YNN_INVALID_VALUE_ID);
+    std::vector<uint32_t> gate_scale_ids(num_tiles, YNN_INVALID_VALUE_ID);
+    std::vector<uint32_t> up_weight_ids(num_tiles, YNN_INVALID_VALUE_ID);
+    std::vector<uint32_t> up_scale_ids(num_tiles, YNN_INVALID_VALUE_ID);
+    std::vector<uint32_t> down_weight_ids(num_tiles, YNN_INVALID_VALUE_ID);
+    uint32_t down_scale_id = YNN_INVALID_VALUE_ID;
+    uint32_t input_scale_id = YNN_INVALID_VALUE_ID;
+    uint32_t first_output_scale_id = YNN_INVALID_VALUE_ID;
+    uint32_t down_input_scale_id = YNN_INVALID_VALUE_ID;
+    uint32_t down_output_scale_id = YNN_INVALID_VALUE_ID;
+    const float input_scale = 1.0f;
+    const float first_output_scale = 1.0f / 128.0f;
+    const float down_input_scale = 1.0f / 128.0f;
+    const float down_output_scale = 1.0f / 128.0f;
+    SubgraphBuilder subgraph(2);
+    subgraph.AddInput(ynn_type_fp32, TensorShape(2), input_id)
+        .AddTensor(ynn_type_fp32, down_scale.extents(), down_scale_id,
+                   down_scale.data())
+        .AddTensor(ynn_type_fp32, TensorShape{}, input_scale_id, &input_scale,
+                   YNN_VALUE_FLAG_COPY_DATA)
+        .AddTensor(ynn_type_fp32, TensorShape{}, first_output_scale_id,
+                   &first_output_scale, YNN_VALUE_FLAG_COPY_DATA)
+        .AddTensor(ynn_type_fp32, TensorShape{}, down_input_scale_id,
+                   &down_input_scale, YNN_VALUE_FLAG_COPY_DATA)
+        .AddTensor(ynn_type_fp32, TensorShape{}, down_output_scale_id,
+                   &down_output_scale, YNN_VALUE_FLAG_COPY_DATA)
+        .AddOutput(ynn_type_fp32, TensorShape(2), output_id);
+    const std::vector<size_t> first_shape{hidden, tile_size};
+    const std::vector<size_t> first_scale_shape{tile_size, 1};
+    const std::vector<size_t> down_shape{tile_size, output_width};
+    for (size_t tile = 0; tile < num_tiles; ++tile) {
+      subgraph
+          .AddTensor(ynn_type_int8, first_shape, gate_weight_ids[tile],
+                     gate_weight.data() + tile * hidden * tile_size)
+          .AddTensor(ynn_type_fp32, first_scale_shape, gate_scale_ids[tile],
+                     gate_scale.data() + tile * tile_size)
+          .AddTensor(ynn_type_int8, down_shape, down_weight_ids[tile],
+                     down_weight.data() + tile * tile_size * output_width);
+      if (gated) {
+        subgraph
+            .AddTensor(ynn_type_int8, first_shape, up_weight_ids[tile],
+                       up_weight.data() + tile * hidden * tile_size)
+            .AddTensor(ynn_type_fp32, first_scale_shape, up_scale_ids[tile],
+                       up_scale.data() + tile * tile_size);
+      }
+    }
+    uint32_t actual_output_id = output_id;
+    ASSERT_EQ(define_packed_feed_forward(
+                  subgraph.GetSubgraph(), input_id, input_scale_id,
+                  gate_weight_ids.data(), gate_scale_ids.data(),
+                  gated ? up_weight_ids.data() : nullptr,
+                  gated ? up_scale_ids.data() : nullptr, first_output_scale_id,
+                  down_weight_ids.data(), down_scale_id, down_input_scale_id,
+                  down_output_scale_id, hidden, intermediate, tile_size, gated,
+                  actual_output_id),
+              ynn_status_success);
+    ASSERT_EQ(actual_output_id, output_id);
+
+    MakeRuntime(subgraph.GetSubgraph());
+    ReshapeExternalTensor(input_id, {rows, hidden}, input.data());
+    SetupExternalTensor(output_id, output.data());
+    RunPipeline();
+    EXPECT_LE(max_allocation_size_, rows * tile_size * sizeof(float));
+    const auto calibrate = [](float value, float scale) {
+      return std::clamp(std::nearbyint(value / scale), -128.0f, 127.0f) * scale;
+    };
+    const float gate = calibrate(1.0f, 1.0f / 128.0f);
+    const float gelu =
+        gate * 0.5f *
+        (1.0f + std::tanh(std::sqrt(2.0f / M_PI) *
+                          (gate + 0.044715f * gate * gate * gate)));
+    const float activated = gelu * (gated ? gate : 1.0f);
+    const float expected =
+        calibrate(std::nearbyint(activated * 128.0f) / 128.0f, 1.0f / 128.0f);
+    for (size_t row = 0; row < rows; ++row) {
+      for (size_t column = 0; column < output_width; ++column) {
+        ASSERT_NEAR(output({row, column}), expected, 1e-5f);
+      }
     }
   }
 }
