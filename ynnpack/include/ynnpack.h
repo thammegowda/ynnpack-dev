@@ -1,0 +1,723 @@
+// Copyright 2025 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#ifndef XNNPACK_YNNPACK_INCLUDE_YNNPACK_H_
+#define XNNPACK_YNNPACK_INCLUDE_YNNPACK_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// A value ID that is never valid.
+#define YNN_INVALID_VALUE_ID UINT32_MAX
+
+// The most dimensions that can appear in a value.
+#define YNN_MAX_TENSOR_RANK 8
+
+// This flag indicates that YNNPACK should attempt to produce numerically
+// consistent results from a specific build of YNNPACK. This causes YNNPACK to
+// avoid using faster codepaths that are numerically inconsistent with any
+// other codepath that could be used in the same compiled YNNPACK library.
+#define YNN_FLAG_CONSISTENT_ARITHMETIC (1 << 1)
+
+// Disallows optimizations that result in more precision than the graph
+// specified.
+#define YNN_FLAG_NO_EXCESS_PRECISION (1 << 2)
+
+// Allows fast, lower-accuracy approximations for transcendental functions.
+#define YNN_FLAG_FAST_MATH (1 << 3)
+
+#ifdef __GNUC__
+#define YNN_DEPRECATED __attribute__((deprecated))
+#else
+#define YNN_DEPRECATED
+#endif
+
+enum ynn_status {
+  ynn_status_success = 0,
+  ynn_status_error = 1,
+  ynn_status_invalid_parameter = 2,
+  ynn_status_unsupported_parameter = 3,
+  ynn_status_deprecated = 4,
+};
+
+// -----------------------------------------------------------------------------
+// Section 1. Subgraph Construction
+// -----------------------------------------------------------------------------
+
+typedef struct ynn_subgraph* ynn_subgraph_t;
+
+// This type is an alias for `slinky::thread_pool`. A `slinky::thread_pool`
+// instance may be casted to `ynn_threadpool` and passed to YNNPACK APIs.
+typedef struct ynn_threadpool* ynn_threadpool_t;
+
+// Create a new subgraph, with `external_value_ids` reserved ids for external
+// values.
+// Supported flags: `YNN_FLAG_CONSISTENT_ARITHMETIC`
+enum ynn_status ynn_create_subgraph(uint32_t external_value_ids, uint32_t flags,
+                                    ynn_subgraph_t* subgraph_out);
+
+// Delete a subgraph previously created with `ynn_create_subgraph`.
+void ynn_delete_subgraph(ynn_subgraph_t subgraph);
+
+// Apply subgraph rewrites and other optimizations to the subgraph.
+ynn_status ynn_optimize_subgraph(ynn_subgraph_t subgraph,
+                                 ynn_threadpool_t threadpool, uint32_t flags);
+
+// -----------------------------------------------------------------------------
+// Section 2. Values and Tensors
+// -----------------------------------------------------------------------------
+
+// Describes a type for a value.
+enum ynn_type {
+  ynn_type_invalid = -1,
+
+  ynn_type_int2 = 0,
+  ynn_type_uint2 = 1,
+  ynn_type_int4 = 2,
+  ynn_type_uint4 = 3,
+  ynn_type_int8 = 4,
+  ynn_type_uint8 = 5,
+  ynn_type_int32 = 6,
+  ynn_type_fp16 = 7,
+  ynn_type_bf16 = 8,
+  ynn_type_fp32 = 9,
+  ynn_type_fp64 = 10,
+  ynn_type_fp8_e5m2 = 11,
+  ynn_type_fp8_e4m3 = 12,
+};
+
+#define YNN_VALUE_FLAG_EXTERNAL_INPUT (1 << 0)
+#define YNN_VALUE_FLAG_EXTERNAL_OUTPUT (1 << 1)
+#define YNN_VALUE_FLAG_COPY_DATA (1 << 2)
+#define YNN_VALUE_FLAG_NO_EXCESS_PRECISION (1 << 3)
+#define YNN_VALUE_FLAG_DATA_IS_FP32 (1 << 4)
+#define YNN_VALUE_FLAG_COPY_DATA_FP32 \
+  (YNN_VALUE_FLAG_COPY_DATA | YNN_VALUE_FLAG_DATA_IS_FP32)
+
+// Define a new tensor in a subgraph.
+//
+// If the value is an external input (`YNN_VALUE_FLAG_EXTERNAL_INPUT`), `dims`
+// is an optional parameter. If `dims` is NULL, or `dims[d]` is 0, the shape is
+// dynamic in dimension `d`, and must be set with `ynn_set_external_value_shape`
+// prior to calling `ynn_invoke_runtime`. If `dims` is non-NULL or `dims[d]` is
+// not 0, the shape is static in dimension `d`, and cannot be changed. If
+// `dims[d]` is 1, dimension `d` is a broadcast dimension.
+//
+// If the value is an external output ('YNN_VALUE_FLAG_EXTERNAL_OUTPUT'), the
+// shape will be retrievable via `ynn_get_external_value_shape` after calling
+// `xnn_reshape_runtime`.
+//
+// If `data` is non-NULL, the value is static, and `dims` is a required
+// parameter. The shape is static and cannot be changed.
+//
+// In all other cases, the `rank` and `dims` parameters are ignored and inferred
+// by the subgraph nodes that produce this value.
+//
+// The ID of the new tensor will be stored in `id_out`.
+//
+// `data` may be non-null, indicating the tensor has a constant value. The
+// caller must maintain the lifetime of this data as long as the subgraph
+// exists, unless the `YNN_VALUE_FLAG_COPY_DATA` flag is used, indicating that
+// this function will make a copy of the data, releasing the caller of the
+// obligation to maintain it.
+//
+// If the `YNN_VALUE_FLAG_NO_EXCESS_PRECISION` flag is set, this value will not
+// be promoted to a wider type as part of optimization.
+enum ynn_status ynn_define_tensor(ynn_subgraph_t subgraph, enum ynn_type type,
+                                  size_t rank, const size_t* dims,
+                                  const void* data, uint32_t flags,
+                                  uint32_t* id_out);
+
+// Defines a tensor with values that are a linear combination of its indices and
+// the given `stride_id` tensor:
+//   output[i_0, ..., i_{rank-1}] = begin + sum_{d=0}^{rank-1} (i_d *
+//   stride[d])
+//
+// `begin_id` may be YNN_INVALID_VALUE_ID, indicating the sequence should start
+// at 0.
+//
+// `stride_id` is a 1D tensor with extent `rank`, where element i indicates the
+// step between output elements in dimension i.
+//
+// If `YNN_NODE_FLAG_LESS_ZERO` is set, the result will be 1 if the result is
+// less than 0, or 0 otherwise.
+//
+// The ID of the new tensor will be stored in `output_id`. If `*output_id` is
+// not `YNN_INVALID_VALUE_ID`, it must be a valid ID of a tensor previously
+// defined by `ynn_define_tensor`.
+enum ynn_status ynn_define_iota(ynn_subgraph_t subgraph, enum ynn_type type,
+                                size_t rank, const size_t* dims,
+                                uint32_t begin_id, uint32_t stride_id,
+                                uint32_t* output_id, uint32_t flags);
+
+#define YNN_NODE_FLAG_KEEP_DIMS (1 << 0)
+#define YNN_NODE_FLAG_SLICE_DIMS (1 << 0)
+#define YNN_NODE_FLAG_KEEP_SHAPE (1 << 0)
+#define YNN_NODE_FLAG_RESHAPE_1D (1 << 0)
+#define YNN_NODE_FLAG_UNIQUE_DIMS (1 << 1)
+#define YNN_NODE_FLAG_NO_EXCESS_PRECISION (1 << 2)
+#define YNN_NODE_FLAG_LESS_ZERO (1 << 3)
+#define YNN_NODE_FLAG_SYMMETRIC_B (1 << 4)
+
+// -----------------------------------------------------------------------------
+// Section 3. Elementwise operations
+// -----------------------------------------------------------------------------
+//
+// The following group of functions define elementwise operations. All
+// elementwise operations support the same broadcasting conventions:
+// - The rank of the result is equal to the maximum of the rank of all of the
+// inputs.
+// - If an input has a lower rank than the output rank, the input has leading
+// broadcast dimensions inserted to match the output rank.
+// - In a particular dimension, the extent of all of the inputs in that
+// dimension must match, unless the input dimension is a broadcast dimension.
+
+enum ynn_unary_operator {
+  ynn_unary_invalid = 0,
+
+  ynn_unary_abs = 1,
+  ynn_unary_ceil = 2,
+  ynn_unary_convert = 3,
+  ynn_unary_cos = 4,
+  ynn_unary_cbrt = 5,
+  ynn_unary_erf = 6,
+  ynn_unary_exp = 7,
+  ynn_unary_expm1 = 8,
+  ynn_unary_floor = 9,
+  ynn_unary_hardswish = 10,
+  ynn_unary_log = 11,
+  ynn_unary_log1p = 12,
+  ynn_unary_negate = 13,
+  ynn_unary_rsqrt = 14,
+  ynn_unary_round = 15,
+  ynn_unary_sigmoid = 16,
+  ynn_unary_sign = 17,
+  ynn_unary_sin = 18,
+  ynn_unary_square = 19,
+  ynn_unary_sqrt = 20,
+  ynn_unary_tanh = 21,
+  ynn_unary_poly3 = 22,
+  ynn_unary_round_to_bf16 = 23,
+  ynn_unary_approx_erf = 24,
+  ynn_unary_approx_tanh = 25,
+  ynn_unary_tan = 26,
+
+  // Internal use only
+  ynn_unary_requantize_to_uint8,
+
+  // For backwards compatibility
+  ynn_unary_cosine = ynn_unary_cos,
+  ynn_unary_sine = ynn_unary_sin,
+  ynn_unary_tangent = ynn_unary_tan,
+  ynn_unary_square_root = ynn_unary_sqrt,
+  ynn_unary_reciprocal_square_root = ynn_unary_rsqrt,
+  ynn_unary_cube_root = ynn_unary_cbrt,
+};
+
+// Defines a unary operation of a single input to a single output.
+enum ynn_status ynn_define_unary(ynn_subgraph_t subgraph,
+                                 enum ynn_unary_operator op,
+                                 uint32_t input_a_id, uint32_t* output_id,
+                                 uint32_t flags);
+
+// Defines a polynomial operation of a single input to a single
+// output: y = coefficients[degree]*x^degree + ... + coefficients[0]
+enum ynn_status ynn_define_unary_polynomial(ynn_subgraph_t subgraph,
+                                            uint32_t input_id, size_t degree,
+                                            const double* coefficients,
+                                            uint32_t* output_id,
+                                            uint32_t flags);
+
+// A helper for `ynn_define_unary` with `op` = `ynn_unary_convert`, which is
+// capable of defining the output value.
+//
+// If the `YNN_NODE_FLAG_NO_EXCESS_PRECISION` flag is set, the resulting value
+// will have the `YNN_VALUE_FLAG_NO_EXCESS_PRECISION` flag set.
+enum ynn_status ynn_define_convert(ynn_subgraph_t subgraph, uint32_t input_id,
+                                   enum ynn_type type, uint32_t* output_id,
+                                   uint32_t flags);
+
+// A helper for `ynn_define_unary` with `op` = `ynn_unary_convert`, which is
+// capable of defining the output value.
+enum ynn_status ynn_define_convert_v2(ynn_subgraph_t subgraph,
+                                      uint32_t input_id, enum ynn_type type,
+                                      uint32_t* output_id, uint32_t flags);
+
+// Conceptually, a quantized tensor has the value `x*scale + zero_point`, where
+// `x` is the quantized tensor, `scale` is an fp32 tensor, and `zero_point` is
+// an int32 tensor. Like any other elementwise op, the `scale` and `zero_point`
+// tensors must have the same shape as `x`. These tensors are usually broadcasts
+// in at least some of the dimensions. Some common quantization schemes include:
+// - Per-tensor quantization: `zero_point_id` and `scale_id` both refer to
+//   broadcasted scalar values.
+// - Per-channel quantization: `zero_point_id` refers to a broadcasted scalar,
+//   `scale_id` refers to a tensor with a single non-broadcasted dimension.
+// - Blockwise quantization: `zero_point_id` refers to a broadcasted scalar,
+//   `scale_id` refers to a tensor that is broadcasted by a block size factor,
+//   and then reshaped.
+
+// Define a quantize operation. `output_id` will be a tensor of type `type`
+// quantized with `zero_point_id` and `scale_id`.
+enum ynn_status ynn_define_quantize(ynn_subgraph_t subgraph, uint32_t input_id,
+                                    enum ynn_type type, uint32_t zero_point_id,
+                                    uint32_t scale_id, uint32_t* output_id,
+                                    uint32_t flags);
+
+// Define a dequantize operation. `output_id` will be a tensor of type `type`
+// dequantized from `input_id` using `zero_point_id` and `scale_id`.
+enum ynn_status ynn_define_dequantize(ynn_subgraph_t subgraph,
+                                      uint32_t input_id, uint32_t zero_point_id,
+                                      uint32_t scale_id, enum ynn_type type,
+                                      uint32_t* output_id, uint32_t flags);
+
+// Define quantization parameters dynamically based on the min and max of a
+// range of values. `min_max_id` should have a leading dimension of extent 2,
+// where index 0 is the min and index 1 is the max (this requirement is
+// satisfied by producing `min_max_id` by `ynn_define_reduce` with the
+// `ynn_reduce_min_max` operator). `zero_point_id` and `scale_id` will have the
+// same dimensions as `min_max_id` except for this leading dimension.
+enum ynn_status ynn_define_dynamic_quantization(
+    ynn_subgraph_t subgraph, uint32_t min_max_id, enum ynn_type type,
+    uint32_t* zero_point_id, uint32_t* scale_id, uint32_t flags);
+
+enum ynn_binary_operator {
+  ynn_binary_invalid = 0,
+
+  ynn_binary_add = 1,
+  ynn_binary_copysign = 2,
+  ynn_binary_divide = 3,
+  ynn_binary_leaky_relu = 4,  // computes a < 0 ? a * b : a
+  ynn_binary_max = 5,
+  ynn_binary_min = 6,
+  ynn_binary_multiply = 7,
+  ynn_binary_pow = 8,
+  ynn_binary_squared_difference = 9,
+  ynn_binary_subtract = 10,
+
+  // Internal use only
+  ynn_binary_exp_subtract,
+};
+
+// Defines a binary operation of two inputs to a single output.
+//
+// If the output is not defined, the output type will be:
+// - The type of a, if b can be losslessly converted to the type of a.
+// - The type of b, if a can be losslessly converted to the type of b.
+// - fp32 otherwise.
+enum ynn_status ynn_define_binary(ynn_subgraph_t subgraph,
+                                  enum ynn_binary_operator op,
+                                  uint32_t input_a_id, uint32_t input_b_id,
+                                  uint32_t* output_id, uint32_t flags);
+
+// -----------------------------------------------------------------------------
+// Section 4. Copies and layout transformations
+// -----------------------------------------------------------------------------
+//
+// All of these operations copy from one of the inputs with no other processing.
+//
+// Many of these operations allow specifying axes by index. In addition to a
+// simple dimension index, these parameters support the following values:
+// - Negative `axis` indicates that the dimension is `rank + axis`, i.e. `-1`
+// refers to the last dimension.
+// - A dimension that refers to a dimension that is out of bounds refers to a
+// broadcast dimension. **Because of this, many of these operations do nothing
+// (and not errors) when an axis parameter is out of bounds.**
+//
+// There are often multiple ways to express a given operation. Some of these
+// expressions have advantages and disadvantages.
+//
+// **Broadcasting**
+//
+// Prefer implementing broadcasting in order of preference using the following
+// approaches:
+//
+// 1. Broadcasting should be performed by relying on broadcast dimensions.
+// Dimensions that are newly created by YNNPACK operations or are defined to
+// have extent 1 by `ynn_define_tensor` are broadcast dimensions. Broadcasts
+// implemented this way avoid realizing the broadcast into memory, and there is
+// no operation in the graph to process at initialization time.
+//
+// 2. If a dimension is expected to be extent 1, but is not a broadcast
+// dimension, use `ynn_define_broadcast` to mark the dimension as a broadcast
+// dimension.
+//
+// 3. `ynn_define_broadcast_like` or `ynn_define_static_broadcast` define a
+// broadcasted value with a specific shape. **If YNNPACK cannot fold these
+// operations into their consumers, they will realize a broadcasted tensor into
+// memory.**
+//
+// **Adding and removing dimensions**
+//
+// `ynn_define_static_transpose` is a very general operation and can be used to
+// add or remove dimensions in addition to performing transposes. To remove a
+// dimension, omit it from the `axes` list. To add a new broadcast dimension,
+// include a dimension index that doesn't exist in the `input`. When adding or
+// removing dimensions, `num_axes` specifies the rank of the output tensor.
+//
+// `ynn_define_static_expand_dims` adds new broadcast dimensions at `new_axes`.
+//
+// `ynn_define_static_slice` with `flags` `YNN_NODE_FLAG_SLICE_DIMS` will remove
+// a dimension after performing a slice of the `input`.
+//
+// Other less preferred approaches:
+// - `ynn_define_split_dim` with a `1` in `splits` at the appropriate position
+// will make a new dimension.
+// - `ynn_define_fuse_dim` or `ynn_define_fuse_dims` of dimensions with extent 1
+// will drop those dimensions.
+// - `ynn_define_static_reshape` can add or remove extent 1 dimensions, but
+// requires fully specifying the entire shape, which may not be possible if some
+// dimensions are dynamic.
+
+// Defines a gather operation. This computes:
+//
+//   output[i, j, k, ...] = input[
+//     index[index_of(axes, 0), i, j, k, ...] if 0 in axes else i,
+//     index[index_of(axes, 1), i, j, k, ...] if 1 in axes else j,
+//     index[index_of(axes, 2), i, j, k, ...] if 2 in axes else k,
+//     ...]
+//
+// If `num_axes == 1`, the first dimension of `index` (which would have size 1)
+// may be omitted. In this case, the operation computes:
+//
+//   output[i, j, k, ...] = input[..., index[i, j, k, ...], ...]
+//
+// where the `index` tensor replaces the gathered axis.
+//
+// `output_rank` specifies the rank of the output tensor.
+enum ynn_status ynn_define_gather(ynn_subgraph_t subgraph, size_t num_axes,
+                                  const int32_t* axes, size_t output_rank,
+                                  uint32_t input_id, uint32_t index_id,
+                                  uint32_t* output_id, uint32_t flags);
+
+// Changes the shape of `input_id` to have the shape `new_dims`, by broadcasting
+// extent 1 dimensions. If `new_dims[d]` is zero, dimension `d` is passed
+// through unchanged. If the rank of `input_id` is less than `rank`,
+// leading broadcasting dimensions are inserted.
+//
+// This operation might explicitly generate a new tensor with the given shape in
+// memory. This is rarely necessary in YNNPACK. Better alternatives include:
+// - No op may be needed at all. If the dimension is a broadcast dimension, most
+// operations can implicitly broadcast as needed.
+// - If the dimension is extent 1, but not a broadcast dimension,
+// `ynn_define_broadcast` will make the dimension a broadcast dimension, but the
+// dimension will still have extent 1, and the operation is usually not realized
+// into memory.
+enum ynn_status ynn_define_static_broadcast(ynn_subgraph_t subgraph,
+                                            size_t rank, const size_t* new_dims,
+                                            uint32_t input_id,
+                                            uint32_t* output_id,
+                                            uint32_t flags);
+
+// Changes the shape of `input_id` to have a similar shape as `template_id`, by
+// replacing extent 1 dimensions with broadcasts. The operation is limited to
+// the set of dimensions in `axes`. If the rank of `input_id` is less than
+// `num_axes`, leading broadcasting dimensions are inserted.
+enum ynn_status ynn_define_broadcast_like(ynn_subgraph_t subgraph,
+                                          size_t num_axes, const int32_t* axes,
+                                          uint32_t input_id,
+                                          uint32_t template_id,
+                                          uint32_t* output_id, uint32_t flags);
+
+// Replaces `axes` dimensions with broadcast dimensions. `axes` dimensions of
+// the input must have extent 1 or already be broadcasted.
+enum ynn_status ynn_define_broadcast(ynn_subgraph_t subgraph, size_t num_axes,
+                                     const int32_t* axes, uint32_t input_id,
+                                     uint32_t* output_id, uint32_t flags);
+
+// Inserts new broadcast dimensions at the positions identified by `new_axes`.
+enum ynn_status ynn_define_static_expand_dims(
+    ynn_subgraph_t subgraph, size_t num_new_axes, const int32_t* new_axes,
+    uint32_t input_id, uint32_t* output_id, uint32_t flags);
+
+// Reinterprets the memory of `input_id` to have the shape `new_dims`. The new
+// shape must have the same number of elements in it as the shape of `input_id`.
+// `new_dims` may have exactly one zero in it, indicating that dimension should
+// be computed such that the input and output have the same total size. Extent 1
+// dimensions will be broadcast dimensions.
+enum ynn_status ynn_define_static_reshape(ynn_subgraph_t subgraph, size_t rank,
+                                          const size_t* new_dims,
+                                          uint32_t input_id,
+                                          uint32_t* output_id, uint32_t flags);
+
+// Fuses `axes_count` dimensions starting at `axis` into one dimension. This is
+// equivalent to `ynn_define_static_reshape`, except `new_dims` are dynamically
+// determined from `input_id`.
+enum ynn_status ynn_define_fuse_dim(ynn_subgraph_t subgraph, int32_t axis,
+                                    size_t axes_count, uint32_t input_id,
+                                    uint32_t* output_id, uint32_t flags);
+
+// Splits `axis` into new dimensions identified by `splits`. `splits` may
+// contain exactly one zero in it, indicating that dimension should be computed
+// such that the input and output have the same total size.
+enum ynn_status ynn_define_split_dim(ynn_subgraph_t subgraph, int32_t axis,
+                                     size_t num_splits, const size_t* splits,
+                                     uint32_t input_id, uint32_t* output_id,
+                                     uint32_t flags);
+
+// Fuses `axes_count` pairs of dimensions starting with the dimension identified
+// by `axes`.
+enum ynn_status ynn_define_fuse_dims(ynn_subgraph_t subgraph, size_t num_axes,
+                                     const int32_t* axes, uint32_t input_id,
+                                     uint32_t* output_id, uint32_t flags);
+
+// Concatenates `input_ids` along the `axis` dimension. `input_ids` must have
+// dimensions with the same extents in all dimensions except `axis`.
+enum ynn_status ynn_define_concatenate(ynn_subgraph_t subgraph, int32_t axis,
+                                       size_t num_inputs,
+                                       const uint32_t* input_ids,
+                                       uint32_t* output_id, uint32_t flags);
+
+// Stacks `input_ids` into an output with a new `axis` dimension. `input_ids`
+// must have dimensions with the same extents in all dimensions.
+enum ynn_status ynn_define_stack(ynn_subgraph_t subgraph, int32_t axis,
+                                 size_t num_inputs, const uint32_t* input_ids,
+                                 uint32_t* output_id, uint32_t flags);
+
+// Copies `input_id` to `output_id`.
+enum ynn_status ynn_define_copy(ynn_subgraph_t subgraph, uint32_t input_id,
+                                uint32_t* output_id, uint32_t flags);
+
+// Splits `input_id` into `output_ids` evenly in the `axis` dimension.
+// `num_outputs` must divide the extent of dimension `axis` of `input_id`.
+enum ynn_status ynn_define_even_split(ynn_subgraph_t subgraph, int32_t axis,
+                                      uint32_t input_id, size_t num_outputs,
+                                      uint32_t* output_ids, uint32_t flags);
+
+// Extracts the range of indices `[begin, end)` with stride `strides` in the
+// `axes` dimensions. If the `YNN_NODE_FLAG_SLICE_DIMS` flag is set, this
+// operation slices `axes` at `begins`, and then removes those axes from the
+// result. Sliced dimensions that result in extent 1 become broadcast
+// dimensions.
+enum ynn_status ynn_define_static_slice(
+    ynn_subgraph_t subgraph, size_t num_axes, const int32_t* axes,
+    const int64_t* begins, const int64_t* ends, const int64_t* strides,
+    uint32_t input_id, uint32_t* output_id, uint32_t flags);
+
+// Extracts the range of indices `[0, end)` in `axes` dimensions, where `end` is
+// the extent of the same axis in the template value.
+//
+// If the YNN_NODE_FLAG_KEEP_SHAPE flag is set, this replaces the sliced values
+// with zeros; the shape of the output is unchanged by this operation.
+enum ynn_status ynn_define_slice_like(ynn_subgraph_t subgraph, size_t num_axes,
+                                      const int32_t* axes, uint32_t input_id,
+                                      uint32_t template_id, uint32_t* output_id,
+                                      uint32_t flags);
+
+// Copy the input to the output, using a permutation `axes` to select the
+// dimensions of the input. Dimensions can be removed (by not including the
+// dimension in the permutation) or added (by using a dimension that is larger
+// than the rank of the input). Newly added dimensions are broadcast dimensions.
+//
+// If `YNN_NODE_FLAG_KEEP_DIMS` is set, `num_axes` specifies the number of
+// dimensions in `axes` to reorder. The specified dimensions are reordered among
+// their positions in the input tensor, and all other dimensions are left in
+// place. The output tensor has the same rank as the input tensor.
+enum ynn_status ynn_define_static_transpose(
+    ynn_subgraph_t subgraph, size_t num_axes, const int32_t* axes,
+    uint32_t input_id, uint32_t* output_id, uint32_t flags);
+
+// Copies from `input_id` (when not in the padded area) or `padding_id` (when in
+// the padded area) to `output_id`. The padded area is defined by the
+// `pre_paddings` and `post_paddings` extents in each dimension. The extents may
+// be negative, indicating that the input is cropped instead of padded in that
+// dimension.
+enum ynn_status ynn_define_static_pad(ynn_subgraph_t subgraph, size_t num_axes,
+                                      const int32_t* axes,
+                                      const int64_t* pre_paddings,
+                                      const int64_t* post_paddings,
+                                      uint32_t input_id, uint32_t padding_id,
+                                      uint32_t* output_id, uint32_t flags);
+
+// Copies potentially overlapping windows of `input_id` into new "stencil
+// dimensions". An example of one stencil dimension is:
+//
+//   output(dx, x) = input(x * stencil_stride + dx * stencil_dilation)
+//
+// If `padding_id` is `YNN_INVALID_VALUE_ID`, `dx` will have extent
+// `stencil_axes`, and `x` will have the maximum extent such that
+// `x * stencil_stride + dx * stencil_dilation` does not exceed the max of the
+// original dimension in `input_id`.
+//
+// If `padding_id` is a valid value, padding is added such that the output
+// (before dividing by the stride) has the same extent as the input.
+//
+// `stencil_axes` identifies which dimensions should have this transformation
+// applied. The stencil dimension is placed as specified by `new_axes`.
+//
+// For example, to produce a 3x3 stencil with the following layout:
+//
+//    output(n, y, x, dy, dx, c) = input(n, y + dy, x + dx, c)
+//
+// Use:
+// - num_stencils = 2
+// - stencil_axes = [1, 2]
+// - new_axes = [3, 4]
+// - stencil_dims = [3, 3]
+// - stencil_strides = [1, 1]
+// - stencil_dilations = [1, 1]
+enum ynn_status ynn_define_stencil_copy(
+    ynn_subgraph_t subgraph, size_t num_stencils, const int32_t* stencil_axes,
+    const int32_t* new_axes, const size_t* stencil_dims,
+    const size_t* stencil_strides, const size_t* stencil_dilations,
+    uint32_t input_id, uint32_t padding_id, uint32_t* output_id,
+    uint32_t flags);
+
+// -----------------------------------------------------------------------------
+// Section 5. Reductions
+// -----------------------------------------------------------------------------
+
+// Performs the operation:
+//
+//   output(batch_dims..., i, j) = c(batch_dims..., i, j)
+//   output(batch_dims..., i, j) +=
+//     a(batch_dims..., i, k_dims...) * b(batch_dims..., k_dims..., j)
+//
+// If num_k_dims = 1, this is a matrix multiply.
+//
+// The batch dimensions are elementwise dimensions. Inputs `a`, `b`, and `c` are
+// permitted to have differing numbers of batch dimensions or broadcast
+// dimensions; leading broadcast dimensions are inserted to match the rank of
+// the output.
+//
+// If `output_id` is `YNN_INVALID_VALUE_ID`, the output type will be:
+// - ynn_type_int32 if both `input_a_id` and `input_b_id` are integer values,
+// - ynn_type_fp32 otherwise.
+//
+// `input_c_id` is optional (`YNN_INVALID_VALUE_ID`). If provided, it acts as an
+// additive accumulator or bias: output = dot(a, b) + c.
+//
+// If the `YNN_NODE_FLAG_SYMMETRIC_B` flag is set, this operation will assume
+// that `input_b_id` can be negated without overflow.
+enum ynn_status ynn_define_dot(ynn_subgraph_t subgraph, size_t num_k_dims,
+                               uint32_t input_a_id, uint32_t input_b_id,
+                               uint32_t input_c_id, uint32_t* output_id,
+                               uint32_t flags);
+
+enum ynn_reduce_operator {
+  ynn_reduce_invalid = 0,
+
+  ynn_reduce_max = 1,
+  ynn_reduce_min = 2,
+  ynn_reduce_min_max = 3,
+  ynn_reduce_sum = 4,
+  ynn_reduce_sum_squared = 5,
+};
+
+// Performs the operation:
+//
+//   output(...) = b(...)
+//   output(...) = op(output(...), a(...))
+//
+// `YNN_NODE_FLAG_KEEP_DIMS` indicates that a reduction should keep the reduced
+// dimensions in the result as broadcast dimensions (with extent 1).
+//
+// If `output_id` is `YNN_INVALID_VALUE_ID` and `op` is `ynn_reduce_sum` or the
+// output type will be:
+// - ynn_type_int32 if the input is an integer type
+// - ynn_type_fp32 if the input is a floating point type
+// If `output_id` is `YNN_INVALID_VALUE_ID` and `op` is `ynn_reduce_min` or
+// `ynn_reduce_max`, the output type will be the same as the input type.
+//
+// If `input_b_id` is `YNN_INVALID_VALUE_ID`, `b` is defined to be the
+// "identity" value for the reduction operator:
+// - 0 if `op` is `ynn_reduce_sum`,
+// - The min or max value of the type for `ynn_reduce_max` or `ynn_reduce_min`.
+//
+// If `op` produces multiple outputs, the outputs are stored in a new dimension
+// 0 of the result.
+enum ynn_status ynn_define_reduce(ynn_subgraph_t subgraph,
+                                  enum ynn_reduce_operator op, size_t num_axes,
+                                  const int32_t* axes, uint32_t input_a_id,
+                                  uint32_t input_b_id, uint32_t* output_id,
+                                  uint32_t flags);
+
+// Get `axes` dimensions of the shape of `value_id` and store it in `output_id`.
+// If the `YNN_NODE_FLAG_RESHAPE_1D` flag is set, the result will be the product
+// of the selected axes. If the `YNN_NODE_FLAG_UNIQUE_DIMS` flag is set, `axes`
+// are deduplicated. Broadcast dimensions are reported as having extent 1.
+enum ynn_status ynn_define_get_tensor_shape(ynn_subgraph_t subgraph,
+                                            size_t num_axes,
+                                            const int32_t* axes, ynn_type type,
+                                            size_t rank, uint32_t value_id,
+                                            uint32_t* output_id,
+                                            uint32_t flags);
+
+// -----------------------------------------------------------------------------
+// Section 6. Runtime
+// -----------------------------------------------------------------------------
+
+typedef struct ynn_runtime* ynn_runtime_t;
+
+// An interface for allowing YNNPACK to access a provider of parallelism.
+struct ynn_scheduler {
+  // Returns how many tasks can be executed in parallel.
+  int (*num_threads)(void* context);
+
+  // Schedules a task to run, may return immediately before the task is
+  // complete.
+  void (*schedule)(void* context, void* task_context,
+                   void (*task)(void* task_context));
+};
+
+typedef const struct ynn_scheduler* ynn_scheduler_t;
+
+// Create a threadpool that uses `scheduler` to start work on other threads.
+// `scheduler` is not copied, since it is stateless we expect it to be stored
+// globally.
+enum ynn_status ynn_create_threadpool(ynn_scheduler_t scheduler,
+                                      void* scheduler_context, uint32_t flags,
+                                      ynn_threadpool_t* threadpool_out);
+
+void ynn_delete_threadpool(ynn_threadpool_t threadpool);
+
+#define YNN_RUNTIME_FLAG_NO_SCHEDULE (1 << 0)
+
+enum ynn_status ynn_create_runtime(ynn_subgraph_t subgraph,
+                                   ynn_threadpool_t threadpool, uint32_t flags,
+                                   ynn_runtime_t* runtime_out);
+
+enum ynn_status ynn_update_runtime_with_threadpool(ynn_runtime_t runtime,
+                                                   ynn_threadpool_t threadpool);
+
+enum ynn_status ynn_set_external_value_shape(ynn_runtime_t runtime,
+                                             uint32_t external_id, size_t rank,
+                                             const size_t* dims);
+
+enum ynn_status ynn_get_external_value_shape(ynn_runtime_t runtime,
+                                             uint32_t external_id, size_t* rank,
+                                             size_t* dims);
+
+enum ynn_status ynn_reshape_runtime(ynn_runtime_t runtime);
+
+enum ynn_status ynn_set_external_value_data(ynn_runtime_t runtime,
+                                            uint32_t external_id, void* data);
+
+enum ynn_status ynn_invoke_runtime(ynn_runtime_t runtime);
+
+enum ynn_runtime_property {
+  // The maximum number of tasks the runtime expects to run concurrently.
+  // `result` should be an `int32_t`
+  ynn_runtime_property_concurrency = 0,
+};
+
+// Query the runtime for the value of a property identified by `property`.
+// `result` points to a property-specific type.`result_size` should indicate how
+// much memory is available to write to `result`, and the value will be updated
+// to indicate how much memory was actually written.
+enum ynn_status ynn_query_runtime(ynn_runtime_t runtime,
+                                  enum ynn_runtime_property property,
+                                  void* result, size_t* result_size);
+
+void ynn_delete_runtime(ynn_runtime_t runtime);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#endif  // XNNPACK_YNNPACK_INCLUDE_YNNPACK_H_

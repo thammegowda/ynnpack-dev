@@ -1,0 +1,690 @@
+// Copyright 2025 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include "ynnpack/subgraph/reduce.h"
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "ynnpack/base/algorithm.h"
+#include "ynnpack/base/arithmetic.h"
+#include "ynnpack/base/base.h"
+#include "ynnpack/base/log.h"
+#include "ynnpack/base/span.h"
+#include "ynnpack/base/to_string.h"
+#include "ynnpack/base/type.h"
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/kernels/reduce/reduce.h"
+#include "ynnpack/subgraph/runtime.h"
+#include "ynnpack/subgraph/slinky.h"
+#include "ynnpack/subgraph/subgraph.h"
+#include "ynnpack/subgraph/utils.h"
+#include "slinky/base/arithmetic.h"
+#include "slinky/builder/pipeline.h"
+#include "slinky/builder/simplify.h"
+#include "slinky/runtime/buffer.h"
+#include "slinky/runtime/expr.h"
+#include "slinky/runtime/stmt.h"
+
+namespace ynn {
+
+float get_reduce_identity(ynn_reduce_operator op) {
+  switch (op) {
+    case ynn_reduce_sum:
+    case ynn_reduce_sum_squared:
+      return 0.0f;
+    case ynn_reduce_max:
+      return -std::numeric_limits<float>::infinity();
+    case ynn_reduce_min:
+      return std::numeric_limits<float>::infinity();
+    default:
+      return std::numeric_limits<float>::quiet_NaN();
+  }
+}
+
+namespace {
+
+ynn_type get_promoted_type(ynn_type type) {
+  switch (type) {
+    case ynn_type_int2:
+    case ynn_type_int4:
+      return ynn_type_int8;
+    case ynn_type_fp8_e5m2:
+      return ynn_type_fp16;
+    case ynn_type_fp8_e4m3:
+      return ynn_type_bf16;
+    default:
+      return type;
+  }
+}
+
+// The wrapper for the kernel we use when we actually want to run a reduce
+// kernel on some buffers.
+auto make_unary_reduce_impl(const ynn_node::reduce& op, reduce_kernel kernel) {
+  return [op, kernel](
+             slinky::buffer<const void, max_tensor_rank> a,
+             slinky::buffer<const void, max_tensor_rank> init_c,
+             slinky::buffer<void, max_tensor_rank> c,
+             const slinky::raw_buffer& reduction_bounds) -> slinky::index_t {
+    bool init_output = true;
+    if (op.keep_dims) {
+      int r_dim = 0;
+      for (int i = 0; i < a.rank && r_dim < reduction_bounds.rank; ++i) {
+        if (op.k_dims[i]) {
+          const slinky::dim& r_dim_i = reduction_bounds.dim(r_dim++);
+          if (c.dim(i).stride() == 0) {
+            assert(c.dim(i).is_point());
+            if (r_dim_i.min() != 0) {
+              // Only initialize the output of a broadcast if it's the first
+              // tile.
+              init_output = false;
+            }
+          } else {
+            // We are writing a partial reduction result (avoiding a race
+            // condition if this reduction dimension is parallelized). We need
+            // to figure out which partial result to write to, which is the
+            // index divided by the split factor of the partial results.
+            slinky::index_t split_factor = r_dim_i.fold_factor();
+            if (split_factor != slinky::dim::unfolded) {
+              assert(split_factor > 0);
+              // This currently allows for multiple partial reduction results,
+              // but the way this works now is we will only write to the first
+              // one. We initialize the rest, so the final reduction computes
+              // the right thing, but this is a little wasteful if it happens.
+              slinky::index_t c_min_i = r_dim_i.min() / split_factor;
+              slinky::index_t c_max_i = r_dim_i.max() / split_factor;
+              c.crop(i, c_min_i, c_max_i);
+            }
+          }
+        }
+      }
+    } else {
+      // Determine if this is the first tile in the reduction.
+      for (int i = 0; i < reduction_bounds.rank; ++i) {
+        if (reduction_bounds.dim(i).min() != 0) {
+          init_output = false;
+          break;
+        }
+      }
+    }
+    if (init_output) {
+      // If this is the first tile, we need to initialize the output.
+      if (init_c.base() == c.base()) {
+        // The input and accumulator were aliased to the same buffer, we don't
+        // need to copy it.
+        // TODO: Do we need to slice init_c first? Or maybe just fall through to
+        // slinky::copy and make it optimize this case?
+      } else {
+        slinky::copy(init_c, c);
+      }
+    }
+
+    // Slice off the "channel" dimension if any.
+    slinky::index_t c_stride_m = 0;
+    if (op.op == ynn_reduce_min_max) {
+      c_stride_m = c.dim(c.rank - 1).stride();
+      c.rank -= 1;
+    }
+
+    // Conceptually, a reduction is c = f(c, a) for all indices of a. We need to
+    // do a few things to implement this:
+    // 1. We need broadcast dimensions in c corresponding to the reduction
+    // dimensions in a. If `keep_dims` is false, that means inserting new
+    // broadcast dimensions.
+    // 2. Remove the dimensions handled by the kernel.
+    // 3. We can optimize the loops over the buffers by fusing contiguous
+    // dimensions where possible.
+    size_t n = 1;
+    size_t k1 = 1;
+    size_t k2 = 1;
+    size_t a_stride_n = 0;
+    size_t a_stride_k2 = 0;
+
+    int sliced = 0;
+    int reduction_idx = 0;
+    for (int i = 0; i < a.rank;) {
+      const slinky::dim& a_dim_i = a.dim(i);
+      if (a_dim_i.empty()) {
+        // The reduction is an empty reduction, so we are done after
+        // initializing the output.
+        return 0;
+      } else if (op.k_dims[i + sliced]) {
+        const slinky::dim& r_dim_i = reduction_bounds.dim(reduction_idx);
+        assert(r_dim_i.stride() == 0);
+
+        assert(a_dim_i.contains(r_dim_i));
+        const slinky::index_t r_extent_i = r_dim_i.extent();
+        assert(!a_dim_i.is_folded(r_dim_i.min(), r_dim_i.max()));
+        if (r_extent_i == 1) {
+          // Slice extent 1 dimensions, they don't affect the result.
+        } else if (k1 * a.elem_size == a_dim_i.stride()) {
+          k1 *= r_extent_i;
+        } else if (a_stride_k2 * k2 == a_dim_i.stride()) {
+          k2 *= r_extent_i;
+        } else if (k2 == 1) {
+          k2 = r_extent_i;
+          a_stride_k2 = a_dim_i.stride();
+        } else {
+          // This is a reduction dimension that is not handled by the kernel.
+          if (op.keep_dims) {
+            // Replace the existing dimension in c with the reduction dimension.
+            c.mutable_dim(i) = r_dim_i;
+          } else {
+            // Add the reduction dimension to c.
+            c.unslice(i, r_dim_i);
+          }
+          ++i;
+          ++reduction_idx;
+          continue;
+        }
+        // This is a reduction dimension that is handled by the kernel.
+        a.slice(i, slinky::in_bounds{r_dim_i.min()});
+        if (op.keep_dims) {
+          // If op.keep_dims is true, that means the buffer has these
+          // dimensions, but we don't want them there for dimensions we handle
+          // with the kernel.
+          c.slice(i);
+        }
+        ++sliced;
+        ++reduction_idx;
+      } else {
+        const slinky::dim& c_dim_i = c.dim(i);
+        const slinky::index_t c_extent_i = c_dim_i.extent();
+        // Not a reduction dimension. If we haven't already found a dimension
+        // for the kernel, give it this one.
+        if (c_extent_i == 1) {
+          // Slice extent 1 dimensions, they don't affect the result.
+        } else if (c_dim_i.stride() == n * c.elem_size) {
+          if (a_stride_n * n == a_dim_i.stride()) {
+            n *= c_dim_i.extent();
+          } else if (n == 1) {
+            n = c_dim_i.extent();
+            a_stride_n = a_dim_i.stride();
+          } else {
+            ++i;
+            continue;
+          }
+        } else {
+          ++i;
+          continue;
+        }
+        assert(!a_dim_i.is_folded(c_dim_i));
+        assert(!c_dim_i.is_folded());
+        a.slice(i, slinky::in_bounds{c_dim_i.min()});
+        c.slice(i);
+        ++sliced;
+      }
+    }
+
+    // The k1 kernel always works.
+    reduce_kernel_fn kernel_fn = kernel.k1;
+    if (k1 == 1 && (n == 1 || a_stride_n == a.elem_size)) {
+      // There is no reduction in the k1 dimension, and the n dimension is
+      // contiguous in a, the kn kernel will be much faster.
+      kernel_fn = kernel.kn;
+      k1 = k2;
+      a_stride_n = a_stride_k2;
+      k2 = 1;
+    }
+
+    slinky::for_each_element(
+        [&](void* c0, const void* a) {
+          void* c1 = offset_bytes(c0, c_stride_m);
+          for (size_t i = 0; i < k2; ++i) {
+            kernel_fn(n, k1, a_stride_n, a, c0, c1);
+            a = offset_bytes(a, a_stride_k2);
+          }
+        },
+        c, a);
+
+    return 0;
+  };
+}
+
+ynn_type get_accumulator_type(ynn_reduce_operator op, ynn_type a_type) {
+  if (a_type == ynn_type_fp64) {
+    return ynn_type_fp64;
+  }
+  switch (op) {
+    case ynn_reduce_sum:
+    case ynn_reduce_sum_squared:
+      return ynn::type_is_integral(a_type) ? ynn_type_int32 : ynn_type_fp32;
+    case ynn_reduce_max:
+    case ynn_reduce_min:
+    case ynn_reduce_min_max:
+      return a_type;
+    default:
+      YNN_UNREACHABLE;
+  }
+}
+
+// Makes an identity for a reduction. For most reductions, this is a simple
+// rank-zero scalar. But for min_max reductions, we need a different reduction
+// identity value for the min and the max.
+slinky::raw_buffer_ptr make_reduce_identity(ynn_type type, int rank,
+                                            ynn_reduce_operator op) {
+  slinky::dim dims[max_tensor_rank];
+  slinky::raw_buffer value;
+  value.rank = 0;
+  value.elem_size = ynn::type_size_bytes(type);
+  value.dims = dims;
+
+  float value_f32[2];
+  size_t n = 1;
+  if (op == ynn_reduce_min_max) {
+    value.rank = rank;
+    for (int i = 0; i < rank - 1; ++i) {
+      value.mutable_dim(i) = slinky::dim::broadcast();
+    }
+    value.mutable_dim(rank - 1) = slinky::dim(0, 1, value.elem_size);
+    value_f32[0] = get_reduce_identity(ynn_reduce_min);
+    value_f32[1] = get_reduce_identity(ynn_reduce_max);
+    n = 2;
+  } else {
+    value_f32[0] = get_reduce_identity(op);
+  }
+
+  assert(type_size_bytes(type) <= sizeof(double));
+  alignas(double) char storage[2 * sizeof(double)] = {
+      0,
+  };
+  value.base = storage;
+  convert_n(value_f32, n, type, value.base);
+  return slinky::raw_buffer::make_copy(value);
+}
+
+// make_split_factors hands out the tile area innermost-first, so an early
+// large dimension can consume all of it and leave later dimensions with a
+// split of 1. Guard against that with two reservation floors (alignments),
+// both counted in the *stored* type: a sub-byte input is promoted, but
+// the promoting convert fuses into the reduction loops and reads the
+// packed stored input, so byte-derived floors must use its density, not
+// the promoted one.
+std::vector<slinky::expr> compute_reduce_alignments(
+    ynn_type stored_type, span<const slinky::expr> extents,
+    const axes_set& k_dims) {
+  // A tile is read as contiguous rows: dimension 0's split, extended by the
+  // kept dimensions above it while their extents are covered whole. Short
+  // rows are dominated by per-row kernel startup, which is especially
+  // expensive for the sub-byte unpack.
+  constexpr slinky::index_t row_target_bytes = 1024;
+  // Each tile must reduce at least this many elements, as the *product* of
+  // its reduction-dimension chunks, so writing out the partial accumulators
+  // is amortized: with a chunk of 1 the "partial reduction" is just an
+  // expensive copy of the input. This floor is also what lets a reduction
+  // dimension small enough to fit in the tile reach its full extent, so no
+  // partial reduction is created at all.
+  constexpr slinky::index_t min_reduction_elems = 256;
+
+  const size_t stored_size = std::max<size_t>(1, type_size_bytes(stored_type));
+  const slinky::index_t row_elems = std::max<size_t>(
+      1, row_target_bytes * type_element_count(stored_type) / stored_size);
+  // Alignments passed to make_split_factors must not exceed the extents, so
+  // every floor below is clamped by the extent of its dimension.
+  const int rank = extents.size();
+  std::vector<slinky::expr> alignments(rank);
+  if (rank > 0) {
+    alignments[0] =
+        slinky::simplify(slinky::max(1, slinky::min(row_elems, extents[0])));
+    if (!k_dims[0]) {
+      // Dimension 0 reserves the whole row target; each kept dimension of the
+      // contiguous prefix above it only reserves the factor still missing.
+      slinky::expr prefix = alignments[0];
+      for (int i = 1; i < rank && !k_dims[i]; ++i) {
+        alignments[i] = slinky::simplify(slinky::max(
+            1, slinky::min(slinky::ceil_div(slinky::expr(row_elems), prefix),
+                           extents[i])));
+        prefix = slinky::simplify(prefix * alignments[i]);
+      }
+    }
+  }
+  // Visiting dimensions inner to outer, k_chunk_so_far accumulates the
+  // chunk product already guaranteed by the inner reduction dimensions
+  // (including dimension 0's row reservation when it is a reduction
+  // dimension), so each outer reduction dimension only reserves the factor
+  // still missing from the target.
+  slinky::expr k_chunk_so_far = 1;
+  for (int i = 0; i < rank; ++i) {
+    if (!k_dims[i]) continue;
+    if (i > 0) {
+      alignments[i] = slinky::simplify(slinky::max(
+          1, slinky::min(slinky::ceil_div(slinky::expr(min_reduction_elems),
+                                          k_chunk_so_far),
+                         extents[i])));
+    }
+    k_chunk_so_far = slinky::simplify(k_chunk_so_far * alignments[i]);
+  }
+  return alignments;
+}
+
+}  // namespace
+
+void define_reduce(ynn_subgraph& subgraph, ynn_node& node,
+                   ynn_reduce_operator op, const ynn::axes_set& k_dims,
+                   uint32_t input_a_id, uint32_t input_b_id,
+                   uint32_t* output_id, bool keep_dims,
+                   std::vector<slinky::expr> split_factors) {
+  const ynn_value& a = subgraph.value(input_a_id);
+
+  ynn_type output_type = get_accumulator_type(op, a.type);
+  ynn_value& output = subgraph.get_output_value(output_id, output_type);
+
+  auto split_factor = [&](size_t i) {
+    return i < split_factors.size() ? split_factors[i] : slinky::expr{};
+  };
+
+  // Propagate shape
+  output.extents = a.extents;
+  for (int i = static_cast<int>(output.extents.size()) - 1; i >= 0; --i) {
+    if (k_dims[i]) {
+      if (keep_dims) {
+        if (split_factor(i).defined()) {
+          output.extents[i] = slinky::simplify(
+              slinky::ceil_div(max(1, output.extents[i]), split_factor(i)));
+        } else {
+          output.extents[i] = {};
+        }
+      } else {
+        output.extents.erase(output.extents.begin() + i);
+      }
+    }
+  }
+
+  if (op == ynn_reduce_min_max) {
+    // This reduction adds a dimension for the min/max index.
+    output.extents.push_back(2);
+  }
+
+  if (input_b_id != YNN_INVALID_VALUE_ID) {
+    const ynn_value& b = subgraph.value(input_b_id);
+    if (b.as_scalar() == get_reduce_identity(op)) {
+      // This is the default value, using the default enables some fusions to
+      // happen.
+      input_b_id = YNN_INVALID_VALUE_ID;
+    } else if (b.type != output.type) {
+      input_b_id = YNN_INVALID_VALUE_ID;
+      ynn_define_convert(&subgraph, b.id, output.type, &input_b_id,
+                         /*flags=*/0);
+    }
+  }
+
+  node.inputs = {input_a_id, input_b_id};
+  node.outputs = {*output_id};
+  node.op = ynn_node::reduce{k_dims, op, keep_dims};
+
+  node.create = [split_factors](const ynn_node& node, ynn_runtime& runtime) {
+    const ynn_node::reduce& op = std::get<ynn_node::reduce>(node.op);
+    const ynn_runtime_value& input_a = runtime.value(node.inputs[0]);
+    ynn_runtime_value& output = runtime.value(node.outputs[0]);
+
+    // Get the reduce kernel we are going to use.
+    reduce_kernel kernel = get_reduce_kernel(op.op, input_a.type, output.type);
+    if (!kernel.k1 || !kernel.kn) {
+      YNN_LOG_ERROR() << "Unsupported reduction " << to_string(op.op) << " for "
+                      << to_string(input_a.type) << " to "
+                      << to_string(output.type);
+      return ynn_status_unsupported_parameter;
+    }
+
+    auto identity_buffer = slinky::buffer_expr::make_constant(
+        runtime.globals.symbols, "identity",
+        make_reduce_identity(output.type, output.rank(), op.op));
+
+    ynn_runtime_value input_c;
+    if (node.inputs[1] != YNN_INVALID_VALUE_ID) {
+      input_c = runtime.value(node.inputs[1]);
+    } else {
+      input_c.buffer = identity_buffer;
+    }
+
+    output.make_buffer(runtime);
+
+    // We want to be able to schedule producers for the reduction inside the
+    // reduction loops. To be able to do this, we need the loops to be in the
+    // slinky pipeline. To implement this, we make a dummy buffer that contains
+    // the reduction dimensions as its dimensions, but with an element size and
+    // stride of 0 (so it will not actually occupy any memory).
+    // Both the output and this reduction buffer are outputs to the pipeline
+    // stage, so slinky generates loops for both sets of dimensions. We can then
+    // schedule these loops like any other dimensions.
+    slinky::buffer_expr_ptr reduction_buffer = slinky::buffer_expr::make(
+        runtime.globals.symbols, "reduction", op.k_dims.count(), 0);
+
+    auto split_factor = [&](size_t i) {
+      return i < split_factors.size() ? split_factors[i] : slinky::expr{};
+    };
+
+    std::vector<slinky::var> output_dims;
+    std::vector<slinky::var> reduction_dims;
+    std::vector<slinky::var> all_dims;
+    slinky::box_expr a_bounds;
+    slinky::box_expr a_crop;
+    int reduction_dim = 0;
+    for (int i = 0; i < input_a.rank(); ++i) {
+      slinky::var dim_i = runtime.globals.make_dim(i);
+      const slinky::expr& a_extent_i = input_a.extent(i);
+      if (op.k_dims[i]) {
+        // While this is a reduction dimension, we don't want the scheduling
+        // mechanism to treat it like one. We can parallelize it.
+        slinky::var reduction_dim_i =
+            split_factor(i).defined()
+                ? runtime.globals.make_dim(reduction_dim, "r")
+                : runtime.globals.make_reduction_dim(reduction_dim);
+        all_dims.push_back(reduction_dim_i);
+        reduction_dims.push_back(reduction_dim_i);
+
+        a_bounds.push_back(slinky::point(reduction_dim_i));
+        a_crop.push_back(slinky::min_extent(0, a_extent_i));
+        if (op.keep_dims) {
+          output_dims.push_back(dim_i);
+        }
+
+        // Set up the reduction buffer. We pass the split factor to the callback
+        // via the stride (since we don't actually need it otherwise).
+        reduction_buffer->dim(reduction_dim).bounds =
+            slinky::min_extent(0, max(a_extent_i, 1));
+        reduction_buffer->dim(reduction_dim).stride = 0;
+        reduction_buffer->dim(reduction_dim).fold_factor = split_factor(i);
+
+        ++reduction_dim;
+      } else {
+        all_dims.push_back(dim_i);
+        output_dims.push_back(dim_i);
+        a_bounds.push_back(elementwise_bounds(dim_i, a_extent_i));
+        a_crop.push_back({});
+      }
+    }
+
+    slinky::box_expr c_bounds =
+        make_elementwise_bounds(output_dims, input_c.physical_extents());
+
+    slinky::call_stmt::attributes attrs;
+    attrs.name = node.to_string();
+    // Allow the input_c and output to be computed in-place, which means we
+    // don't need to initialize the accumulator.
+    if (allow_in_place(input_c.id, output.id, *runtime.subgraph)) {
+      attrs.allow_in_place = (1 << 1);
+    }
+
+    // Schedule the computed reduction loops innermost. A reduction loop is
+    // always serial, so leaving it outside the parallel pure loops re-enters
+    // the thread pool on every one of its iterations. It is also a matching
+    // fence: nothing fuses at or below the first non-pure split, so an outer
+    // reduction loop blocks the pure loops behind it from fusing at all.
+    // Splits are still computed per dimension as before; only the loop order
+    // changes (a partial reduction's given pr_split loops are pure and stay
+    // where they are declared).
+    std::vector<slinky::expr> phys_extents = input_a.physical_extents();
+    std::unique_ptr<ynn::scheduling_info> sched;
+    bool computed_reduction = false;
+    for (size_t d = split_factors.size(); d < all_dims.size(); ++d) {
+      if (phys_extents[d].defined() &&
+          !runtime.globals.is_pure_dim(all_dims[d])) {
+        computed_reduction = true;
+      }
+    }
+    if (computed_reduction) {
+      std::vector<slinky::expr> splits =
+          make_split_factors(runtime.globals, phys_extents,
+                             input_a.buffer->elem_size(), split_factors);
+      std::vector<int> order;
+      order.reserve(all_dims.size());
+      for (size_t d = 0; d < all_dims.size(); ++d) {
+        if (!runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
+      }
+      for (size_t d = 0; d < all_dims.size(); ++d) {
+        if (runtime.globals.is_pure_dim(all_dims[d])) order.push_back(d);
+      }
+      sched = runtime.make_schedule(all_dims, phys_extents, splits, order);
+    } else {
+      sched = runtime.make_schedule(all_dims, phys_extents,
+                                    input_a.buffer->elem_size(), split_factors);
+    }
+
+    auto func = slinky::func::make(
+        make_unary_reduce_impl(op, kernel),
+        {{input_a.buffer, std::move(a_bounds), std::move(a_crop)},
+         {input_c.buffer, std::move(c_bounds)}},
+        {{output.buffer, std::move(output_dims)},
+         {reduction_buffer, std::move(reduction_dims)}},
+        std::move(attrs));
+
+    func.user_data() = sched.get();
+    runtime.scheduling_info_storage.push_back(std::move(sched));
+    runtime.funcs.push_back(std::move(func));
+    return ynn_status_success;
+  };
+}
+
+extern "C" {
+
+ynn_status ynn_define_reduce(ynn_subgraph_t subgraph, ynn_reduce_operator op,
+                             size_t num_axes, const int32_t* axes,
+                             uint32_t input_a_id, uint32_t input_b_id,
+                             uint32_t* output_id, uint32_t flags) {
+  // Validate arguments.
+  YNN_RETURN_IF_ERROR(validate_subgraph("reduce", subgraph));
+  YNN_RETURN_IF_ERROR(
+      validate_input_tensor("reduce", subgraph, "input_a_id", input_a_id));
+  YNN_RETURN_IF_ERROR(validate_input_tensor("reduce", subgraph, "input_b_id",
+                                            input_b_id, /*optional=*/true));
+  YNN_RETURN_IF_ERROR(
+      validate_output_tensor("reduce", subgraph, "output_id", output_id));
+
+  const ynn_value* a_ptr = &subgraph->value(input_a_id);
+  // The type the input is stored as. Sub-byte inputs may be promoted below,
+  // but the (fused) convert still reads the stored input, so byte-density
+  // derived floors must be computed from this type, not the promoted one.
+  const ynn_type stored_type = a_ptr->type;
+  ynn_type target_accumulator_type = get_accumulator_type(op, a_ptr->type);
+  reduce_kernel kernel =
+      get_reduce_kernel(op, a_ptr->type, target_accumulator_type);
+  if (!kernel.k1 || !kernel.kn) {
+    if (type_element_count(a_ptr->type) == 1 ||
+        (op != ynn_reduce_min && op != ynn_reduce_max &&
+         op != ynn_reduce_min_max)) {
+      ynn_type promoted_type = get_promoted_type(a_ptr->type);
+      if (promoted_type != a_ptr->type) {
+        uint32_t promoted_input_id = YNN_INVALID_VALUE_ID;
+        YNN_RETURN_IF_ERROR(ynn_define_convert(
+            subgraph, input_a_id, promoted_type, &promoted_input_id, flags));
+        input_a_id = promoted_input_id;
+      }
+    }
+  }
+  const ynn_value& a = subgraph->value(input_a_id);
+
+  ynn::axes_set k_dims;
+  for (size_t i = 0; i < num_axes; ++i) {
+    const int axis = axis_to_slinky_dim(a.rank(), axes[i]);
+    if (axis < a.rank()) {
+      k_dims[axis] = true;
+    } else {
+      // This is a reduction of an implicit broadcast, which is a no-op.
+    }
+  }
+
+  uint32_t convert_to_id = YNN_INVALID_VALUE_ID;
+  if (*output_id != YNN_INVALID_VALUE_ID) {
+    ynn_type output_type = get_accumulator_type(op, a.type);
+    if (subgraph->value(*output_id).type != output_type) {
+      // We need to compute the reduction into an intermediate accumulator, and
+      // convert to the output after.
+      convert_to_id = *output_id;
+      *output_id = YNN_INVALID_VALUE_ID;
+    }
+  }
+
+  if (op != ynn_reduce_min_max) {
+    std::vector<slinky::expr> alignments =
+        compute_reduce_alignments(stored_type, a.extents, k_dims);
+    std::vector<slinky::expr> split_factors = make_split_factors(
+        subgraph->globals, a.extents, type_size_bytes(a.type),
+        /*given_splits=*/{}, /*loop_order=*/{}, alignments);
+
+    // We should only do a partial reduction if we can prove that a dimension is
+    // split. If needed, we could add a flag that would indicate we should
+    // parallelize the reduction even if we don't know any of the dimensions are
+    // split.
+    bool partial_reduction = any_n(split_factors.size(), [&](size_t i) {
+      return k_dims[i] && slinky::prove_true(split_factors[i] < a.extents[i]);
+    });
+
+    if (partial_reduction) {
+      for (size_t i = 0; i < split_factors.size(); ++i) {
+        // We need to create a separate variable for the partial reduction
+        // splits to make them symbolic, so they can be overridden by the
+        // scheduling algorithm later.
+        if (k_dims[i] && split_factors[i].defined()) {
+          split_factors[i] =
+              subgraph->globals.make_split_var(split_factors[i], "pr_split");
+        }
+      }
+      // We want to parallelize the reduction. If so, we need to split it into
+      // two reductions: a parallelized reduction that produces partial
+      // reductions of the result, and a secondary reduction that reduces the
+      // partial results to the final result.
+      uint32_t intermediate_id = YNN_INVALID_VALUE_ID;
+      ynn_node node;
+      define_reduce(*subgraph, node, op, k_dims, input_a_id,
+                    YNN_INVALID_VALUE_ID, &intermediate_id, /*keep_dims=*/true,
+                    split_factors);
+      subgraph->add_node(std::move(node));
+
+      input_a_id = intermediate_id;
+
+      if (op == ynn_reduce_sum_squared) {
+        // The partial results of a sum_squared reduction should be summed (and
+        // not squared).
+        op = ynn_reduce_sum;
+      }
+    }
+  }
+
+  // Make the node.
+  const bool keep_dims = flags & YNN_NODE_FLAG_KEEP_DIMS;
+  ynn_node node;
+  define_reduce(*subgraph, node, op, k_dims, input_a_id, input_b_id, output_id,
+                keep_dims);
+  subgraph->add_node(std::move(node));
+
+  if (convert_to_id != YNN_INVALID_VALUE_ID) {
+    YNN_RETURN_IF_ERROR(ynn_define_unary(subgraph, ynn_unary_convert,
+                                         *output_id, &convert_to_id, flags));
+    *output_id = convert_to_id;
+  }
+
+  return ynn_status_success;
+}
+
+}  // extern "C"
+
+}  // namespace ynn

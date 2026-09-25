@@ -1,0 +1,269 @@
+// Copyright 2022 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <numeric>
+#include <random>
+#include <vector>
+
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+#include "ynnpack/base/arithmetic.h"
+#include "ynnpack/base/base.h"
+#include "ynnpack/base/bfloat16.h"
+#include "ynnpack/base/half.h"
+#include "ynnpack/base/test/buffer.h"
+#include "ynnpack/base/test/fuzz_test.h"
+#include "ynnpack/base/test/random.h"
+#include "ynnpack/base/test/tensor.h"
+#include "ynnpack/base/test/util.h"
+#include "ynnpack/base/type.h"
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/subgraph/test/subgraph_builder.h"
+
+using ynn::to_string;  // NOLINT(misc-unused-using-decls)
+
+namespace ynn {
+
+// Limit rank of tensors for testing, we have no special case codepaths beyond
+// rank 2, so this should be plenty of coverage.
+constexpr int max_test_rank = 5;
+
+template <typename T>
+void test_transpose_2d(T, size_t m, size_t n) {
+  // Define subgraph
+  SubgraphBuilder subgraph(2);
+  subgraph.AddInput(type_of<T>(), 2, 0)
+      .AddOutput(type_of<T>(), 2, 1)
+      .AddTranspose({1, 0}, 0, 1);
+
+  Runtime runtime(subgraph.GetSubgraph());
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+  std::vector<size_t> input_shape = {m, n};
+
+  Buffer<T> input(m * n);
+  for (size_t i = 0; i < m * n; ++i) {
+    input[i] = i;
+  }
+
+  std::vector<size_t> output_shape = {n, m};
+  runtime.ReshapeExternalTensor(input_shape, input.data(), 0).ReshapeRuntime();
+  ASSERT_EQ(runtime.GetExternalTensorShape(1), output_shape);
+
+  // Run subgraph
+  Buffer<T> output(m * n);
+  runtime.SetupExternalTensor(output.data(), 1).InvokeRuntime();
+
+  // Verify results.
+  Buffer<T> expected(m * n);
+  for (size_t i = 0; i < m; ++i) {
+    for (size_t j = 0; j < n; ++j) {
+      expected[j * m + i] = i * n + j;
+    }
+  }
+  EXPECT_THAT(output, testing::ElementsAreArray(expected));
+}
+
+template <typename T>
+void test_slice(T, const std::vector<size_t>& input_shape, int dim) {
+  // Define subgraph
+  SubgraphBuilder subgraph(2);
+  subgraph.AddInput(type_of<T>(), input_shape.size(), 0)
+      .AddOutput(type_of<T>(), 1, 1)
+      .AddTranspose({dim}, 0, 1);
+
+  Runtime runtime(subgraph.GetSubgraph());
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+  size_t input_size =
+      std::accumulate(input_shape.begin(), input_shape.end(),
+                      static_cast<size_t>(1), std::multiplies<size_t>());
+  Buffer<T> input(input_size);
+  for (size_t i = 0; i < input_size; ++i) {
+    input[i] = i;
+  }
+
+  std::vector<size_t> output_shape = {input_shape[dim]};
+  runtime.ReshapeExternalTensor(input_shape, input.data(), 0).ReshapeRuntime();
+  ASSERT_EQ(runtime.GetExternalTensorShape(1), output_shape);
+
+  // Run subgraph
+  Buffer<T> output(input_shape[dim]);
+  runtime.SetupExternalTensor(output.data(), 1).InvokeRuntime();
+
+  // Verify results.
+  size_t stride =
+      std::accumulate(input_shape.begin() + dim + 1, input_shape.end(),
+                      static_cast<size_t>(1), std::multiplies<size_t>());
+  Buffer<T> expected(input_shape[dim]);
+  for (size_t i = 0; i < input_shape[dim]; ++i) {
+    expected[i] = i * stride;
+  }
+  EXPECT_THAT(output, testing::ElementsAreArray(expected));
+}
+
+// Align both the input and output trailing dimensions of a transpose to be a
+// multiple of `align`.
+void align_shape(std::vector<size_t>& shape, const std::vector<int32_t>& perm,
+                 size_t align) {
+  if (!shape.empty()) {
+    shape.back() = align_up(shape.back(), align);
+  }
+  if (!perm.empty() && static_cast<size_t>(perm.back()) < shape.size()) {
+    shape[perm.back()] = align_up(shape[perm.back()], align);
+  }
+};
+
+template <typename T>
+void test_random(T, bool with_copy) {
+  using T_info = type_info<T>;
+  constexpr size_t elem_count = T_info::element_count();
+  const int min_rank = elem_count > 1 ? 1 : 0;
+
+  ReplicableRandomDevice rng;
+  std::uniform_int_distribution<int> input_rank_dist(min_rank, max_test_rank);
+  std::bernoulli_distribution bool_dist(0.5);
+
+  for (auto _ : FuzzTest(std::chrono::milliseconds(100))) {
+    const size_t input_rank = input_rank_dist(rng);
+    const bool keep_dims = bool_dist(rng);
+    const uint32_t flags = keep_dims ? YNN_NODE_FLAG_KEEP_DIMS : 0;
+
+    // Generate a random permutation that has some new dimensions in it.
+    // This avoids generating permutations that use the same input dimension
+    // more than once. This seems like something that maybe should work, but it
+    // doesn't currently.
+    std::vector<int32_t> axes(input_rank);
+    std::iota(axes.begin(), axes.end(), 0);
+    std::shuffle(axes.begin(), axes.end(), rng);
+    std::vector<int32_t> perm = axes;
+
+    if (keep_dims) {
+      // When keep_dims is true, we have a total permutation, and we can delete
+      // the dimensions that aren't moving.
+      for (int i = static_cast<int>(input_rank) - 1; i >= 0; --i) {
+        if (axes[i] == i) axes.erase(axes.begin() + i);
+      }
+    }
+
+    // Define subgraph
+    std::vector<size_t> input_template_shape =
+        random_shape(rng, input_rank, 0, 9);
+    align_shape(input_template_shape, perm, elem_count);
+    SubgraphBuilder subgraph(2);
+    subgraph.AddInput(type_of<T>(), input_template_shape, 0)
+        .AddOutput(type_of<T>(), perm.size(), 1);
+
+    if (with_copy) {
+      // This variation allows the transpose to alias because the output is not
+      // an external output.
+      uint32_t transpose_id = YNN_INVALID_VALUE_ID;
+      subgraph.AddTensor(type_of<T>(), perm.size(), transpose_id);
+      subgraph.AddTranspose(axes, 0, transpose_id, flags)
+          .AddCopy(transpose_id, 1);
+    } else {
+      subgraph.AddTranspose(axes, 0, 1, flags);
+    }
+
+    Runtime runtime(subgraph.GetSubgraph());
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+
+    for (int reshape = 0; reshape < 2; ++reshape) {
+      std::vector<size_t> input_shape = random_shape(rng, input_template_shape);
+      align_shape(input_shape, perm, elem_count);
+
+      Tensor<T> input(input_shape);
+      fill_random(input.data(), input.size(), rng);
+
+      // Make a deep copy so the expected result is contiguous.
+      Tensor<T> expected = input.transpose(perm).deep_copy();
+
+      // Check reshaped shape is correct
+      runtime.ReshapeExternalTensor(input_shape, input.data(), 0)
+          .ReshapeRuntime();
+      ASSERT_EQ(runtime.GetExternalTensorShape(1), expected.extents());
+
+      // Run subgraph
+      Tensor<T> output(expected.extents());
+      runtime.SetupExternalTensor(output.data(), 1).InvokeRuntime();
+
+      // Verify results.
+      ASSERT_THAT(output, testing::ElementsAreArray(expected));
+    }
+  }
+}
+
+template <typename F>
+constexpr decltype(auto) SwitchType(ynn_type type, F&& f) {
+  switch (type) {
+    case ynn_type_int2:
+      return std::forward<F>(f)(int2x4());
+    case ynn_type_uint2:
+      return std::forward<F>(f)(uint2x4());
+    case ynn_type_int4:
+      return std::forward<F>(f)(int4x2());
+    case ynn_type_uint4:
+      return std::forward<F>(f)(uint4x2());
+    case ynn_type_int8:
+      return std::forward<F>(f)(int8_t());
+    case ynn_type_uint8:
+      return std::forward<F>(f)(uint8_t());
+    case ynn_type_int32:
+      return std::forward<F>(f)(int32_t());
+    case ynn_type_fp16:
+      return std::forward<F>(f)(half());
+    case ynn_type_bf16:
+      return std::forward<F>(f)(bfloat16());
+    case ynn_type_fp32:
+      return std::forward<F>(f)(float());
+    default:
+      YNN_UNREACHABLE;
+  }
+}
+
+class Transpose : public ::testing::TestWithParam<ynn_type> {};
+
+TEST_P(Transpose, transpose_2d) {
+  SwitchType(GetParam(), [&](auto type) { test_transpose_2d(type, 8, 4); });
+}
+
+TEST_P(Transpose, slice_0) {
+  SwitchType(GetParam(), [&](auto type) { test_slice(type, {8, 4, 16}, 0); });
+}
+
+TEST_P(Transpose, slice_1) {
+  SwitchType(GetParam(), [&](auto type) { test_slice(type, {8, 4, 16}, 1); });
+}
+
+TEST_P(Transpose, slice_2) {
+  SwitchType(GetParam(), [&](auto type) { test_slice(type, {8, 4, 16}, 2); });
+}
+
+TEST_P(Transpose, random) {
+  SwitchType(GetParam(),
+             [&](auto type) { test_random(type, /*with_copy=*/false); });
+}
+
+TEST_P(Transpose, random_with_copy) {
+  SwitchType(GetParam(),
+             [&](auto type) { test_random(type, /*with_copy=*/true); });
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Transpose, Transpose,
+    testing::Values(ynn_type_int2, ynn_type_uint2, ynn_type_int4,
+                    ynn_type_uint4, ynn_type_int8, ynn_type_uint8,
+                    ynn_type_fp16, ynn_type_bf16, ynn_type_fp32),
+    [](const testing::TestParamInfo<Transpose::ParamType>& info) {
+      return to_string(info.param);
+    });
+
+}  // namespace ynn

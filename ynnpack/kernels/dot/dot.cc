@@ -1,0 +1,559 @@
+// Copyright 2025 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include "ynnpack/kernels/dot/dot.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <type_traits>
+
+#include "ynnpack/base/arch.h"
+#include "ynnpack/base/arithmetic.h"
+#include "ynnpack/base/base.h"
+#include "ynnpack/base/bfloat16.h"
+#include "ynnpack/base/fp8.h"
+#include "ynnpack/base/half.h"
+#include "ynnpack/base/log.h"
+#include "ynnpack/base/type.h"
+#include "ynnpack/include/ynnpack.h"
+
+namespace ynn {
+
+namespace {
+
+template <typename AT, typename BT, typename CT>
+void dot_1x1x1(size_t M, size_t N, size_t K3, size_t K2, size_t K1,
+               size_t A_stride_m, size_t A_stride_k3, size_t A_stride_k2,
+               const AT* A, size_t B_stride_k3, size_t B_stride_k2,
+               size_t B_stride_k1, const BT* B, size_t C_in_stride_m,
+               const CT* C_in, size_t C_out_stride_m, CT* C_out) {
+  using B_info = type_info<BT>;
+  assert(M == 1);
+  CT* acc = YNN_ALLOCA(CT, N);
+  std::fill_n(acc, N, static_cast<CT>(0));
+  for (size_t k3 = 0; k3 < K3; ++k3) {
+    const BT* B_k3 = offset_bytes(B, k3 * B_stride_k3);
+    const AT* A_k3 = offset_bytes(A, k3 * A_stride_k3);
+    for (size_t k2 = 0; k2 < K2; ++k2) {
+      const BT* B_k2 = offset_bytes(B_k3, k2 * B_stride_k2);
+      const AT* A_k2 = offset_bytes(A_k3, k2 * A_stride_k2);
+      for (size_t k1 = 0; k1 < K1; ++k1) {
+        const BT* B_k1 = offset_bytes(B_k2, k1 * B_stride_k1);
+        const AT A_k1 = A_k2[k1];
+        for (size_t j = 0; j < N; ++j) {
+          acc[j] +=
+              static_cast<CT>(A_k1) * static_cast<CT>(B_info::get(B_k1, j));
+        }
+      }
+    }
+  }
+  if (C_in) {
+    for (size_t j = 0; j < N; ++j) {
+      C_out[j] = acc[j] + C_in[j];
+    }
+  } else {
+    std::copy_n(acc, N, C_out);
+  }
+}
+
+template <typename AT, typename BT, typename CT>
+void dot_1x1x2(size_t M, size_t N, size_t K3, size_t K2, size_t K1,
+               size_t A_stride_m, size_t A_stride_k3, size_t A_stride_k2,
+               const AT* A, size_t B_stride_k3, size_t B_stride_k2,
+               size_t B_stride_k1, const BT* B, size_t C_in_stride_m,
+               const CT* C_in, size_t C_out_stride_m, CT* C_out) {
+  using B_info = type_info<BT>;
+  assert(M == 1);
+  assert(K1 % 2 == 0);
+  CT* acc = YNN_ALLOCA(CT, N);
+  std::fill_n(acc, N, 0);
+  for (size_t k3 = 0; k3 < K3; ++k3) {
+    const BT* B_k3 = offset_bytes(B, k3 * B_stride_k3);
+    const AT* A_k3 = offset_bytes(A, k3 * A_stride_k3);
+    for (size_t k2 = 0; k2 < K2; ++k2) {
+      const BT* B_k2 = offset_bytes(B_k3, k2 * B_stride_k2);
+      const AT* A_k2 = offset_bytes(A_k3, k2 * A_stride_k2);
+      for (size_t k1 = 0; k1 < K1; k1 += 2) {
+        const BT* B_k1 = offset_bytes(B_k2, k1 * B_stride_k1);
+        const AT A_k1_0 = A_k2[k1 + 0];
+        const AT A_k1_1 = A_k2[k1 + 1];
+        for (size_t j = 0; j < N; ++j) {
+          const auto B_k1_0 = B_info::get(B_k1, 2 * j + 0);
+          const auto B_k1_1 = B_info::get(B_k1, 2 * j + 1);
+          acc[j] += static_cast<CT>(A_k1_0) * static_cast<CT>(B_k1_0);
+          acc[j] += static_cast<CT>(A_k1_1) * static_cast<CT>(B_k1_1);
+        }
+      }
+    }
+  }
+  if (C_in) {
+    for (size_t j = 0; j < N; ++j) {
+      C_out[j] = acc[j] + C_in[j];
+    }
+  } else {
+    std::copy_n(acc, N, C_out);
+  }
+}
+
+template <typename AT, typename BT, typename CT>
+void dot_1x1x4(size_t M, size_t N, size_t K3, size_t K2, size_t K1,
+               size_t A_stride_m, size_t A_stride_k3, size_t A_stride_k2,
+               const AT* A, size_t B_stride_k3, size_t B_stride_k2,
+               size_t B_stride_k1, const BT* B, size_t C_in_stride_m,
+               const CT* C_in, size_t C_out_stride_m, CT* C_out) {
+  using B_info = type_info<BT>;
+  assert(M == 1);
+  assert(K1 % 4 == 0);
+  CT* acc = YNN_ALLOCA(CT, N);
+  std::fill_n(acc, N, 0);
+  for (size_t k3 = 0; k3 < K3; ++k3) {
+    const BT* B_k3 = offset_bytes(B, k3 * B_stride_k3);
+    const AT* A_k3 = offset_bytes(A, k3 * A_stride_k3);
+    for (size_t k2 = 0; k2 < K2; ++k2) {
+      const BT* B_k2 = offset_bytes(B_k3, k2 * B_stride_k2);
+      const AT* A_k2 = offset_bytes(A_k3, k2 * A_stride_k2);
+      for (size_t k1 = 0; k1 < K1; k1 += 4) {
+        const BT* B_k1 = offset_bytes(B_k2, k1 * B_stride_k1);
+        const AT A_k1_0 = A_k2[k1 + 0];
+        const AT A_k1_1 = A_k2[k1 + 1];
+        const AT A_k1_2 = A_k2[k1 + 2];
+        const AT A_k1_3 = A_k2[k1 + 3];
+        for (size_t j = 0; j < N; ++j) {
+          const auto B_k1_0 = B_info::get(B_k1, 4 * j + 0);
+          const auto B_k1_1 = B_info::get(B_k1, 4 * j + 1);
+          const auto B_k1_2 = B_info::get(B_k1, 4 * j + 2);
+          const auto B_k1_3 = B_info::get(B_k1, 4 * j + 3);
+          acc[j] += static_cast<CT>(A_k1_0) * static_cast<CT>(B_k1_0);
+          acc[j] += static_cast<CT>(A_k1_1) * static_cast<CT>(B_k1_1);
+          acc[j] += static_cast<CT>(A_k1_2) * static_cast<CT>(B_k1_2);
+          acc[j] += static_cast<CT>(A_k1_3) * static_cast<CT>(B_k1_3);
+        }
+      }
+    }
+  }
+  if (C_in) {
+    for (size_t j = 0; j < N; ++j) {
+      C_out[j] = acc[j] + C_in[j];
+    }
+  } else {
+    std::copy_n(acc, N, C_out);
+  }
+}
+
+}  // namespace
+
+void dot_fp32_1xNx1_1x1x1(size_t m, size_t n, size_t k3, size_t k2, size_t k1,
+                          size_t a_stride_m, size_t a_stride_k3,
+                          size_t a_stride_k2, const void* a, size_t b_stride_k3,
+                          size_t b_stride_k2, size_t b_stride_k1, const void* b,
+                          size_t c_in_stride_m, const void* c_in,
+                          size_t c_out_stride_m, void* c_out,
+                          dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const float*>(a), b_stride_k3, b_stride_k2, b_stride_k1,
+            static_cast<const float*>(b), c_in_stride_m,
+            static_cast<const float*>(c_in), c_out_stride_m,
+            static_cast<float*>(c_out));
+}
+
+void dot_fp64_1xNx1_1x1x1(size_t m, size_t n, size_t k3, size_t k2, size_t k1,
+                          size_t a_stride_m, size_t a_stride_k3,
+                          size_t a_stride_k2, const void* a, size_t b_stride_k3,
+                          size_t b_stride_k2, size_t b_stride_k1, const void* b,
+                          size_t c_in_stride_m, const void* c_in,
+                          size_t c_out_stride_m, void* c_out,
+                          dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const double*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const double*>(b), c_in_stride_m,
+            static_cast<const double*>(c_in), c_out_stride_m,
+            static_cast<double*>(c_out));
+}
+
+void dot_fp16_fp16_fp32_1xNx1_1x1x1(size_t m, size_t n, size_t k3, size_t k2,
+                                    size_t k1, size_t a_stride_m,
+                                    size_t a_stride_k3, size_t a_stride_k2,
+                                    const void* a, size_t b_stride_k3,
+                                    size_t b_stride_k2, size_t b_stride_k1,
+                                    const void* b, size_t c_in_stride_m,
+                                    const void* c_in, size_t c_out_stride_m,
+                                    void* c_out, dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const half*>(a), b_stride_k3, b_stride_k2, b_stride_k1,
+            static_cast<const half*>(b), c_in_stride_m,
+            static_cast<const float*>(c_in), c_out_stride_m,
+            static_cast<float*>(c_out));
+}
+
+void dot_bf16_bf16_fp32_1xNx1_1x1x1(size_t m, size_t n, size_t k3, size_t k2,
+                                    size_t k1, size_t a_stride_m,
+                                    size_t a_stride_k3, size_t a_stride_k2,
+                                    const void* a, size_t b_stride_k3,
+                                    size_t b_stride_k2, size_t b_stride_k1,
+                                    const void* b, size_t c_in_stride_m,
+                                    const void* c_in, size_t c_out_stride_m,
+                                    void* c_out, dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const bfloat16*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const bfloat16*>(b), c_in_stride_m,
+            static_cast<const float*>(c_in), c_out_stride_m,
+            static_cast<float*>(c_out));
+}
+
+void dot_int8_int8_int32_1xNx1_1x1x1(size_t m, size_t n, size_t k3, size_t k2,
+                                     size_t k1, size_t a_stride_m,
+                                     size_t a_stride_k3, size_t a_stride_k2,
+                                     const void* a, size_t b_stride_k3,
+                                     size_t b_stride_k2, size_t b_stride_k1,
+                                     const void* b, size_t c_in_stride_m,
+                                     const void* c_in, size_t c_out_stride_m,
+                                     void* c_out, dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const int8_t*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const int8_t*>(b), c_in_stride_m,
+            static_cast<const int32_t*>(c_in), c_out_stride_m,
+            static_cast<int32_t*>(c_out));
+}
+
+void dot_uint8_int8_int32_1xNx1_1x1x1(
+    size_t m, size_t n, size_t k3, size_t k2, size_t k1, size_t a_stride_m,
+    size_t a_stride_k3, size_t a_stride_k2, const void* a, size_t b_stride_k3,
+    size_t b_stride_k2, size_t b_stride_k1, const void* b, size_t c_in_stride_m,
+    const void* c_in, size_t c_out_stride_m, void* c_out,
+    dot_kernel_state* /*state*/) {
+  dot_1x1x1(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const uint8_t*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const int8_t*>(b), c_in_stride_m,
+            static_cast<const int32_t*>(c_in), c_out_stride_m,
+            static_cast<int32_t*>(c_out));
+}
+
+void dot_int8_int4_int32_1xNx2_1x1x2(size_t m, size_t n, size_t k3, size_t k2,
+                                     size_t k1, size_t a_stride_m,
+                                     size_t a_stride_k3, size_t a_stride_k2,
+                                     const void* a, size_t b_stride_k3,
+                                     size_t b_stride_k2, size_t b_stride_k1,
+                                     const void* b, size_t c_in_stride_m,
+                                     const void* c_in, size_t c_out_stride_m,
+                                     void* c_out, dot_kernel_state* /*state*/) {
+  dot_1x1x2(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const int8_t*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const int4x2*>(b), c_in_stride_m,
+            static_cast<const int32_t*>(c_in), c_out_stride_m,
+            static_cast<int32_t*>(c_out));
+}
+
+void dot_int8_int2_int32_1xNx4_1x1x4(size_t m, size_t n, size_t k3, size_t k2,
+                                     size_t k1, size_t a_stride_m,
+                                     size_t a_stride_k3, size_t a_stride_k2,
+                                     const void* a, size_t b_stride_k3,
+                                     size_t b_stride_k2, size_t b_stride_k1,
+                                     const void* b, size_t c_in_stride_m,
+                                     const void* c_in, size_t c_out_stride_m,
+                                     void* c_out, dot_kernel_state* /*state*/) {
+  dot_1x1x4(m, n, k3, k2, k1, a_stride_m, a_stride_k3, a_stride_k2,
+            static_cast<const int8_t*>(a), b_stride_k3, b_stride_k2,
+            b_stride_k1, static_cast<const int2x4*>(b), c_in_stride_m,
+            static_cast<const int32_t*>(c_in), c_out_stride_m,
+            static_cast<int32_t*>(c_out));
+}
+
+namespace {
+
+float estimate_dot_cost_impl(uint32_t m, uint32_t n, uint32_t k,
+                             uint32_t block_m, uint32_t block_n,
+                             uint32_t block_k, uint32_t tile_m, uint32_t tile_n,
+                             uint32_t tile_k, uint32_t b_elem_count) {
+  const float blocks_m = ceil_div(m, block_m);
+  const float blocks_n = ceil_div(n, block_n);
+  const float blocks_k = ceil_div(k, block_k);
+
+  // This model was derived by benchmarking each kernel on a [block_m, block_k *
+  // 64] . [block_k * 64, block_n] dot operation (64 blocks should fit in L1
+  // cache), and then fitting a linear model to a set of features (block/tile
+  // dimensions, memory loaded, etc.). It turned out that the only features the
+  // model really depends on is the number of loads it does, and that loads of b
+  // are ~2x as expensive as loads from a.
+  // TODO(dsharlet): This has been tested on Intel Skylake and AMD Rome, but not
+  // ARM.
+  const uint32_t loads_a = block_m * block_k / (tile_m * tile_k);
+  const uint32_t loads_b = block_n * block_k / (tile_n * tile_k);
+
+  // The cost model doesn't understand that padding has a cost beyond just the
+  // extra computation, so it will think that two kernels that both need the
+  // same number of tiles will cost the same. However, in practice, the smaller
+  // tile would be better, so here, we add a small penalty proportional to the
+  // tile size.
+  const uint32_t tile_cost = tile_m * tile_n * tile_k;
+
+  // We assume that loads from b are more expensive as b_elem_count grows.
+  const float block_cost =
+      loads_a * 5 + loads_b * 11 * b_elem_count + 9 + tile_cost * 1e-4f;
+
+  return blocks_m * blocks_n * blocks_k * block_cost;
+}
+
+// An additional penalty scale term on the cost of a dot kernel based on the
+// architecture.
+float dot_arch_cost_factor(uint64_t arch, uint32_t m, uint32_t n,
+                           uint32_t block_m, uint32_t block_n, uint32_t tile_m,
+                           uint32_t tile_n) {
+  if (arch == arch_flag::none) {
+    // We should only use the default dot kernel if there is no other choice.
+    return 100.0f;
+  }
+#ifdef YNN_ARCH_ARM
+  if (arch & (arch_flag::sme | arch_flag::sme2)) {
+    // At m == 1, NEON is faster than SME due to SME startup overhead and
+    // vector-matrix multiplication not benefiting from outer-product
+    // accumulation. A penalty factor >= 3.0 (here 10.0) ensures NEON is
+    // selected even for sub-byte weights (int4, int2) where NEON's narrow
+    // tile_n inflates its estimated cost relative to SME.
+    if (m == 1) {
+      return 10.0f;
+    }
+  }
+#endif
+#ifdef YNN_ARCH_X86
+  if (arch & arch_flag::avx512vnni || arch & arch_flag::amxint8) {
+    // The VNNI kernels have a smaller unrolling in K than the AVX512 kernels,
+    // which tricks `estimate_dot_cost` into thinking the regular AVX512 kernels
+    // are better. We then also need to adjust AMX, to avoid tricking it into
+    // thinking VNNI is faster than AMX.
+    return 0.5f;
+  }
+  if (arch & arch_flag::amxbf16) {
+    // The AMX 32x48 kernel (2x3 configuration) currently only works better than
+    // 32x32 kernels for small shapes. This may be due to memory bandwidth
+    // limitations, as there are only 2 tiles for A/B and must be frequently
+    // updated.
+    if (block_m == 32 && block_n == 48 && tile_m == 16 && tile_n == 16) {
+      if (n > 48) {
+        return 100.0f;
+      } else {
+        return 0.5f;
+      }
+    }
+  }
+#endif
+  return 1.0f;
+}
+
+template <typename A, typename B, typename C>
+struct optimizer {
+  // Inputs
+  uint32_t m;
+  uint32_t n;
+  uint32_t k;
+  uint32_t required_tile_k;
+  uint32_t required_block_n;
+  uint32_t required_flags;
+  uint32_t disallowed_flags;
+  uint64_t supported_arch_flags;
+
+  // Outputs
+  dot_kernel result;
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+  const char* kernel_used = nullptr;
+#endif
+
+  void operator()(uint64_t arch, uint32_t block_m, uint32_t block_n,
+                  uint32_t block_k, uint32_t tile_m, uint32_t tile_n,
+                  uint32_t tile_k, uint32_t flags, dot_kernel_fn kernel,
+                  const char* name) {
+    // These checks are ordered to minimize the cost of these checks:
+    // - Checks that are more likely to fail should be first.
+    // - Checks that are cheap should be first.
+    if (required_tile_k && tile_k != required_tile_k) {
+      return;
+    }
+    if ((required_flags & flags) != required_flags) {
+      return;
+    }
+    if (disallowed_flags & flags) {
+      return;
+    }
+    if (!is_arch_supported(arch, supported_arch_flags)) {
+      return;
+    }
+    if (required_block_n && (flags & dot_flag::unaligned_b) == 0 &&
+        (required_block_n % tile_n != 0)) {
+      return;
+    }
+    assert(block_m > 0);
+    assert(block_n > 0);
+    assert(block_k > 0);
+    assert(tile_n > 0);
+    assert(tile_k > 0);
+
+    // We might use this kernel, update max_block_n accordingly.
+    result.max_block_n = std::max<int>(result.max_block_n, block_n);
+
+    constexpr int b_elem_count = type_info<B>::element_count();
+    const float dot_cost_k =
+        estimate_dot_cost_impl(m, n, k, block_m, block_n, block_k, tile_m,
+                               tile_n, tile_k, b_elem_count) *
+        dot_arch_cost_factor(arch, m, n, block_m, block_n, tile_m, tile_n);
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+    if (!required_tile_k && !required_block_n) {
+      char selected = dot_cost_k < result.cost ? '*' : ' ';
+      YNN_LOG_DEBUG() << " " << selected << name << " cost=" << dot_cost_k;
+    }
+#endif
+    if (dot_cost_k >= result.cost) {
+      return;
+    }
+    result = {
+        kernel,
+        static_cast<int>(block_m),
+        static_cast<int>(block_n),
+        static_cast<int>(block_k),
+        static_cast<int>(tile_m),
+        static_cast<int>(tile_n),
+        static_cast<int>(tile_k),
+        flags,
+        dot_cost_k,
+        static_cast<int>(result.max_block_n),
+    };
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+    kernel_used = name;
+#endif
+  }
+};
+
+YNN_UNUSED logger& operator<<(logger& os, std::optional<size_t> v) {
+  return v ? os << *v : os << "?";
+}
+YNN_UNUSED null_logger& operator<<(null_logger& os, std::optional<size_t> v) {
+  return v ? os << *v : os << "?";
+}
+
+template <typename A, typename B, typename C>
+dot_kernel get_dot_kernel(const dot_shape& shape, dot_packed_shape packed_shape,
+                          uint32_t required_flags,
+                          std::optional<bool> transpose_a,
+                          uint64_t arch_flags) {
+  if (packed_shape.tile_k == 0 && packed_shape.block_n == 0) {
+    YNN_LOG_DEBUG() << "Selecting kernel for dot " << shape.m << "x" << shape.n
+                    << "x" << shape.k1;
+  }
+
+  uint32_t strictly_required_flags = required_flags;
+  uint32_t disallowed_flags = 0;
+  if (required_flags & dot_flag::symmetric_b) {
+    // We don't require the kernel to be symmetric_b, a non-symmetric_b kernel
+    // might still be faster.
+    strictly_required_flags &= ~dot_flag::symmetric_b;
+  } else {
+    // Don't use a symmetric_b kernel if the caller did not indicate that the
+    // data is symmetric_b.
+    disallowed_flags |= dot_flag::symmetric_b;
+  }
+
+  if (transpose_a.has_value()) {
+    // We need the kernel to match the requested transpose_a.
+    if (*transpose_a) {
+      strictly_required_flags |= dot_flag::transpose_a;
+    } else {
+      disallowed_flags |= dot_flag::transpose_a;
+    }
+  }
+
+  optimizer<A, B, C> optimizer{
+      // These casts might saturate a size_t value, which should be OK, because
+      // if m, n, k are that large, any tail cases will be negligible. Cast to
+      // uint16 so we have some headroom for arithmetic.
+      cast<uint16_t>(shape.m),
+      cast<uint16_t>(shape.n),
+      cast<uint16_t>(shape.k1),
+      static_cast<uint32_t>(packed_shape.tile_k),
+      static_cast<uint32_t>(packed_shape.block_n),
+      strictly_required_flags,
+      disallowed_flags,
+      arch_flags,
+  };
+
+// TODO: Limit this to only a subset of the "prod" kernels.
+#define YNN_DOT_KERNEL(arch, name, block_m, block_n, block_k, tile_m, tile_n, \
+                       tile_k, flags, a_type, b_type, c_type)                 \
+  if (std::is_same<A, a_type>::value && std::is_same<B, b_type>::value &&     \
+      std::is_same<C, c_type>::value) {                                       \
+    optimizer(arch, block_m, block_n, block_k, tile_m, tile_n, tile_k, flags, \
+              name, #name);                                                   \
+  }
+#include "ynnpack/kernels/dot/kernels.inc"
+#undef YNN_DOT_KERNEL
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+  if (packed_shape.tile_k == 0 && packed_shape.block_n == 0) {
+    if (optimizer.result.kernel) {
+      YNN_LOG_DEBUG() << "Using dot kernel " << optimizer.kernel_used
+                      << " for dot " << shape.m << "x" << shape.n << "x"
+                      << shape.k1;
+    }
+  }
+#endif
+  return optimizer.result;
+}
+
+// Moving this to a separate (non-inlined) function cleans up the stack a bit.
+YNN_NO_INLINE dot_kernel get_unsupported_dot_kernel(const dot_type& type) {
+  YNN_LOG_ERROR() << "Unsupported dot type " << type.a << "_" << type.b << "_"
+                  << type.c;
+  return {};
+}
+
+constexpr uint32_t dot_type_id(ynn_type a, ynn_type b, ynn_type c) {
+  return (static_cast<uint32_t>(a) << 16) | (static_cast<uint32_t>(b) << 8) |
+         static_cast<uint32_t>(c);
+}
+
+template <typename A, typename B, typename C>
+constexpr uint32_t dot_type_id() {
+  return dot_type_id(type_of<A>(), type_of<B>(), type_of<C>());
+}
+
+}  // namespace
+
+dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape,
+                          dot_packed_shape packed_shape,
+                          uint32_t required_flags,
+                          std::optional<bool> transpose_a,
+                          uint64_t arch_flags) {
+#define GET_DOT_KERNEL_CASE(a, b, c)                                    \
+  case dot_type_id<a, b, c>():                                          \
+    return get_dot_kernel<a, b, c>(shape, packed_shape, required_flags, \
+                                   transpose_a, arch_flags);
+  switch (dot_type_id(type.a, type.b, type.c)) {
+    GET_DOT_KERNEL_CASE(double, double, double);
+    GET_DOT_KERNEL_CASE(float, float, float);
+    GET_DOT_KERNEL_CASE(half, half, float);
+    GET_DOT_KERNEL_CASE(bfloat16, bfloat16, float);
+    GET_DOT_KERNEL_CASE(int8_t, int8_t, int32_t);
+    GET_DOT_KERNEL_CASE(uint8_t, int8_t, int32_t);
+    GET_DOT_KERNEL_CASE(int8_t, int2x4, int32_t);
+    GET_DOT_KERNEL_CASE(uint8_t, int2x4, int32_t);
+    GET_DOT_KERNEL_CASE(int8_t, int4x2, int32_t);
+    GET_DOT_KERNEL_CASE(uint8_t, int4x2, int32_t);
+    GET_DOT_KERNEL_CASE(fp8_e5m2, fp8_e5m2, float);
+    GET_DOT_KERNEL_CASE(fp8_e4m3, fp8_e4m3, float);
+    default:
+      return get_unsupported_dot_kernel(type);
+  }
+}
+
+float estimate_dot_cost(size_t m, size_t n, size_t k, uint32_t block_m,
+                        uint32_t block_n, uint32_t block_k, uint32_t tile_m,
+                        uint32_t tile_n, uint32_t tile_k,
+                        uint32_t b_elem_count) {
+  // Cast to uint16_t, because we need a bit of headroom to do arithmetic.
+  return estimate_dot_cost_impl(cast<uint16_t>(m), cast<uint16_t>(n),
+                                cast<uint16_t>(k), block_m, block_n, block_k,
+                                tile_m, tile_n, tile_k, b_elem_count);
+}
+
+}  // namespace ynn

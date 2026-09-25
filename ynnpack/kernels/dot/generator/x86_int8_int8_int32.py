@@ -1,0 +1,356 @@
+# Copyright 2025 Google LLC
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Specializations for int8 x86 dot kernel generators."""
+
+# pylint: disable=missing-class-docstring
+# pylint: disable=invalid-name
+
+from ynnpack.kernels.dot.generator.dot_base import generate_dot_kernels
+from ynnpack.kernels.dot.generator.x86 import x86
+from ynnpack.kernels.dot.generator.x86 import x86_avx
+from ynnpack.kernels.dot.generator.x86 import x86_avx512
+
+
+class x86_avx2_int8_int8_int32(x86_avx):
+  def __init__(self, arch="avx2", vector_bits=256):
+    super().__init__(arch, "int8_int8_int32", "int32_t", vector_bits, tile_shape=(1, 8, 4))
+    self.a_type = "int8_t"
+    self.b_type = "int8_t"
+    self.flags += ["dot_flag::consistent_arithmetic"]
+    # This kernel already has 2 accumulators per tile in m.
+    self.min_tiles = max(1, self.min_tiles // 2)
+
+  def header(self):
+    return super().header() + """
+
+namespace {
+
+YNN_INTRINSIC int32_t unaligned_load_int8x4(const int8_t* ptr) {
+    int32_t value;
+    memcpy(&value, ptr, sizeof(int32_t));
+    return value;
+}
+
+}  // namespace
+"""
+
+  def b_alignment_bytes(self):
+    # This kernel loads half-vectors at a time from b.
+    return self.tile_shape[1] * self.tile_shape[2] // 2
+
+  # In this kernel, we load 4 values of A and B at a time, and do a 2-way dot
+  # product, resulting in 2 values (so we need 2 accumulator registers per
+  # tile). We accumulate these 2 values for each value of k, only summing the
+  # result into the final result tile after the loops over k.
+  def finalize_c_tile(self, i, j):
+    # Horizontally add pairs of values, and swap the middle two 64-bits of each
+    # 128-bit result.
+    return f"""
+c_{i}_{j+0} = {self._mm()}_hadd_epi32(c_{i}_{j+0}, c_{i}_{j+4});
+c_{i}_{j} = _mm256_permute4x64_epi64(c_{i}_{j}, 216);
+"""
+
+  def init_c_tile(self, i, j):
+    return f"""
+__m{self.bits}i c_{i}_{j+0} = {self._mm()}_setzero_si{self.bits}();
+__m{self.bits}i c_{i}_{j+4} = {self._mm()}_setzero_si{self.bits}();
+"""
+
+  def load_a_tile(self, i, k):
+    bits = self.bits
+    mm = self._mm()
+    mm2 = self._mm(bits//2)
+    a = f"unaligned_load_int8x4({self.a_ptr(i, k)})"
+    a_ik = f"a_{i}_{k}"
+    return f"__m{bits}i {a_ik} = {mm}_cvtepi8_epi16({mm2}_set1_epi32({a}));\n"
+
+  def load_b_tile(self, k, j):
+    bits = self.bits
+    mm = self._mm()
+    mm2 = self._mm(bits//2)
+    b0_ptr = self.b_ptr(k, j+0, f"__m{bits//2}i")
+    b4_ptr = self.b_ptr(k, j+4, f"__m{bits//2}i")
+    return f"""
+__m{bits}i b_{k}_{j+0} = {mm}_cvtepi8_epi16({mm2}_load_si{bits//2}({b0_ptr}));
+__m{bits}i b_{k}_{j+4} = {mm}_cvtepi8_epi16({mm2}_load_si{bits//2}({b4_ptr}));
+"""
+
+  def product(self, i, j, k):
+    mm = self._mm()
+    c_ij0 = f"c_{i}_{j+0}"
+    c_ij4 = f"c_{i}_{j+4}"
+    return f"""
+{c_ij0} = {mm}_add_epi32({c_ij0}, {mm}_madd_epi16(a_{i}_{k}, b_{k}_{j+0}));
+{c_ij4} = {mm}_add_epi32({c_ij4}, {mm}_madd_epi16(a_{i}_{k}, b_{k}_{j+4}));
+"""
+
+
+class x86_avx512_int8_int8_int32(x86_avx512):
+
+  def __init__(self, arch="avx512", vector_bits=512):
+    super().__init__(arch, "int8_int8_int32", "int32_t", vector_bits, tile_shape=(1, 16, 4))
+    self.a_type = "int8_t"
+    self.b_type = "int8_t"
+    self.flags += ["dot_flag::consistent_arithmetic"]
+    # This kernel already has 2 accumulators per tile.
+    self.min_tiles = max(1, self.min_tiles // 2)
+
+  def header(self):
+    return super().header() + """
+
+namespace {
+
+YNN_INTRINSIC int32_t unaligned_load_int8x4(const void* ptr) {
+    int32_t value;
+    memcpy(&value, ptr, sizeof(int32_t));
+    return value;
+}
+
+YNN_INTRINSIC __m512i _mm512_hadd_epi32(__m512i a, __m512i b) {
+    a = _mm512_add_epi32(a, _mm512_shuffle_epi32(a, _MM_SHUFFLE(2, 3, 0, 1)));
+    b = _mm512_add_epi32(b, _mm512_shuffle_epi32(b, _MM_SHUFFLE(2, 3, 0, 1)));
+    return _mm512_permutex2var_epi32(a,
+        _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30),
+        b
+    );
+}
+
+}  // namespace
+"""
+
+  def b_alignment_bytes(self):
+    # This kernel loads half-vectors at a time from b.
+    return self.tile_shape[1] * self.tile_shape[2] // 2
+
+  # In this kernel, we load 4 values of A and B at a time, and do a 2-way dot
+  # product, resulting in 2 values (so we need 2 accumulator registers per
+  # tile). We accumulate these 2 values for each value of k, only summing the
+  # result into the final result tile after the loops over k.
+  def finalize_c_tile(self, i, j):
+    return f"""
+c_{i}_{j+0} = {self._mm()}_hadd_epi32(c_{i}_{j+0}, c_{i}_{j+8});
+"""
+
+  def init_c_tile(self, i, j):
+    return f"""
+__m{self.bits}i c_{i}_{j+0} = {self._mm()}_setzero_si{self.bits}();
+__m{self.bits}i c_{i}_{j+8} = {self._mm()}_setzero_si{self.bits}();
+"""
+
+  def load_a_tile(self, i, k):
+    bits = self.bits
+    mm = self._mm()
+    mm2 = self._mm(bits//2)
+    a = f"unaligned_load_int8x4({self.a_ptr(i, k)})"
+    a_ik = f"a_{i}_{k}"
+    return f"__m{bits}i {a_ik} = {mm}_cvtepi8_epi16({mm2}_set1_epi32({a}));\n"
+
+  def load_b_tile(self, k, j):
+    bits = self.bits
+    b0_ptr = self.b_ptr(k, j+0, f"__m{bits//2}i")
+    b8_ptr = self.b_ptr(k, j+8, f"__m{bits//2}i")
+    mm = self._mm()
+    mm2 = self._mm(bits//2)
+    return f"""
+__m{bits}i b_{k}_{j+0} = {mm}_cvtepi8_epi16({mm2}_load_si{bits//2}({b0_ptr}));
+__m{bits}i b_{k}_{j+8} = {mm}_cvtepi8_epi16({mm2}_load_si{bits//2}({b8_ptr}));
+"""
+
+  def product(self, i, j, k):
+    mm = self._mm()
+    c_ij0 = f"c_{i}_{j+0}"
+    c_ij8 = f"c_{i}_{j+8}"
+    return f"""
+{c_ij0} = {mm}_add_epi32({c_ij0}, {mm}_madd_epi16(a_{i}_{k}, b_{k}_{j+0}));
+{c_ij8} = {mm}_add_epi32({c_ij8}, {mm}_madd_epi16(a_{i}_{k}, b_{k}_{j+8}));
+"""
+
+
+class x86_int8_int8_int32_symmetric_b(x86):
+
+  def __init__(self, arch, vector_bits, tile_shape):
+    super().__init__(
+        arch,
+        "int8_int8_int32_symmetric_b",
+        "int32_t",
+        vector_bits,
+        tile_shape,
+    )
+    self.a_type = "int8_t"
+    self.b_type = "int8_t"
+    self.flags += ["dot_flag::consistent_arithmetic", "dot_flag::symmetric_b"]
+
+  def header(self):
+    return super().header() + """
+
+namespace {
+
+YNN_INTRINSIC int32_t unaligned_load_int8x4(const int8_t* ptr) {
+    int32_t value;
+    memcpy(&value, ptr, sizeof(int32_t));
+    return value;
+}
+
+template <typename T>
+YNN_INTRINSIC T zero_invalid(T x, std::size_t n) {
+  int8_t lanes[sizeof(T)];
+  memcpy(lanes, &x, sizeof(T));
+  for (std::size_t i = n; i < sizeof(T); ++i) {
+    lanes[i] = 0;
+  }
+  memcpy(&x, lanes, sizeof(T));
+  return x;
+}
+
+}  // namespace
+"""
+
+  def b_alignment_bytes(self):
+    return self.tile_shape[1] * self.tile_shape[2]
+
+  # If we know B is symmetric, we can use pmaddubsw, by transferring the sign
+  # of A to B (which is safe because -b will not overflow), and then taking the
+  # absolute value of A to create an unsigned value in [0, 128].
+
+  def load_a_tile(self, i, k):
+    bits = self.bits
+    mm = self._mm()
+    a = f"unaligned_load_int8x4({self.a_ptr(i, k)})"
+    a_ik = f"a_{i}_{k}"
+    return f"""
+__m{bits}i {a_ik} = {mm}_set1_epi32({a});
+__m{bits}i {a_ik}_abs = {mm}_abs_epi8({a_ik});
+"""
+
+  def load_b_tile(self, k, j):
+    bits = self.bits
+    mm = self._mm()
+    b_ptr = self.b_ptr(k, j + 0, f"__m{bits}i")
+    tile_k = self.tile_shape[2]
+    return f"""
+__m{bits}i b_{k}_{j} = {mm}_load_si{bits}({b_ptr});
+// We assume that b is in the range [-127, 127].
+assert(all({mm}_cmpneq_epi8(zero_invalid(b_{k}_{j}, sub_sat(N, {j}) * {tile_k}), {mm}_set1_epi8(-128))));
+"""
+
+  def product(self, i, j, k):
+    bits = self.bits
+    mm = self._mm()
+    c_ij = f"c_{i}_{j}"
+    ab_ijk = f"ab_{i}_{j}_{k}"
+    return f"""
+__m{bits}i {ab_ijk} = {mm}_maddubs_epi16(a_{i}_{k}_abs, {mm}_sign_epi8(b_{k}_{j}, a_{i}_{k}));
+{c_ij} = {mm}_add_epi32({c_ij}, {mm}_madd_epi16({ab_ijk}, {mm}_set1_epi16(1)));
+"""
+
+
+class x86_avx2_int8_int8_int32_symmetric_b(
+    x86_int8_int8_int32_symmetric_b, x86_avx
+):
+
+  def __init__(self, arch="avx2", vector_bits=256):
+    super().__init__(arch, vector_bits, tile_shape=(1, 8, 4))
+
+  def header(self):
+    return super().header() + """
+
+namespace {
+
+YNN_INTRINSIC __m256i _mm256_cmpneq_epi8(__m256i a, __m256i b) {
+  return _mm256_xor_si256(_mm256_cmpeq_epi8(a, b), _mm256_set1_epi8(-1));
+}
+
+YNN_INTRINSIC bool all(__m256i x) {
+  return !_mm256_testz_si256(x, x);
+}
+
+}  // namespace
+"""
+
+
+class x86_avx512_int8_int8_int32_symmetric_b(
+    x86_int8_int8_int32_symmetric_b, x86_avx512
+):
+
+  def __init__(self, arch="avx512", vector_bits=512):
+    super().__init__(arch, vector_bits, tile_shape=(1, 16, 4))
+
+  def header(self):
+    return super().header() + """
+
+namespace {
+
+// This is not a complete _mm512_sign_epi8 implementation, because it doesn't
+// properly handle 0. We don't need that in this case, because we are going to
+// multiply the two arguments.
+YNN_INTRINSIC __m512i _mm512_sign_epi8(__m512i a, __m512i b) {
+  __m512i zero = _mm512_setzero_si512();
+  __mmask64 blt0 = _mm512_movepi8_mask(b);
+  return _mm512_mask_sub_epi8(a, blt0, zero, a);
+}
+
+YNN_INTRINSIC __m512i _mm512_cmpneq_epi8(__m512i a, __m512i b) {
+  return _mm512_movm_epi8(_mm512_cmpneq_epi8_mask(a, b));
+}
+
+YNN_INTRINSIC bool all(__m512i x) {
+  return _mm512_movepi8_mask(x) == ~uint64_t(0);
+}
+
+}  // namespace
+"""
+
+
+generate_dot_kernels(
+    x86_avx2_int8_int8_int32(),
+    [
+        (1, 32, 4),
+        (1, 16, 4),
+        (2, 16, 4),
+        (1, 8, 4),
+        (3, 8, 4),
+        (4, 8, 4),
+        (6, 8, 4),
+    ],
+)
+
+generate_dot_kernels(
+    x86_avx2_int8_int8_int32_symmetric_b(),
+    [
+        (1, 32, 4),
+        (2, 32, 4),
+        (1, 16, 4),
+        (2, 16, 4),
+        (3, 16, 4),
+        (4, 16, 4),
+    ],
+)
+
+generate_dot_kernels(
+    x86_avx512_int8_int8_int32(),
+    [
+        (1, 64, 4),
+        (2, 64, 4),
+        (1, 32, 4),
+        (3, 32, 4),
+        (4, 32, 4),
+        (5, 32, 4),
+        (6, 32, 4),
+        (1, 16, 4),
+        (8, 16, 4),
+        (12, 16, 4),
+    ],
+)
+
+generate_dot_kernels(
+    x86_avx512_int8_int8_int32_symmetric_b(),
+    [
+        # This is only faster than the non-symmetric kernel in this case, due to
+        # the overhead of emulating _mm512_sign_epi8
+        (1, 64, 4),
+        (1, 32, 4),
+    ],
+)

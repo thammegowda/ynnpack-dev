@@ -1,0 +1,1517 @@
+// Copyright 2025 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include "ynnpack/subgraph/subgraph.h"
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iomanip>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <ostream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "ynnpack/base/algorithm.h"
+#include "ynnpack/base/base.h"
+#include "ynnpack/base/bfloat16.h"
+#include "ynnpack/base/fp8.h"
+#include "ynnpack/base/half.h"
+#include "ynnpack/base/log.h"
+#include "ynnpack/base/to_string.h"
+#include "ynnpack/base/type.h"
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/kernels/ternary/ternary.h"
+#include "ynnpack/subgraph/get_tensor_shape.h"
+#include "ynnpack/subgraph/runtime.h"
+#include "ynnpack/subgraph/tensor.h"
+#include "slinky/base/ref_count.h"
+#include "slinky/base/thread_pool.h"
+#include "slinky/builder/simplify.h"
+#include "slinky/runtime/buffer.h"
+#include "slinky/runtime/evaluate.h"
+#include "slinky/runtime/expr.h"
+#include "slinky/runtime/print.h"
+
+namespace ynn {
+
+// Validation helpers for public APIs.
+ynn_status validate_subgraph(const char* node, ynn_subgraph_t subgraph) {
+  if (subgraph == nullptr) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, subgraph must be non-null";
+    return ynn_status_invalid_parameter;
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_rank(const char* node, const char* rank_of, size_t rank) {
+  if (rank > YNN_MAX_TENSOR_RANK) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, rank " << rank
+                    << " of tensor `" << rank_of
+                    << "` exceeds YNN_MAX_TENSOR_RANK " << YNN_MAX_TENSOR_RANK;
+    return ynn_status_unsupported_parameter;
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_axis(const char* node, const char* axis_of, int rank,
+                         int32_t axis) {
+  if (axis < -rank || axis >= rank) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, axis " << axis
+                    << " exceeds rank " << rank << " of tensor `" << axis_of
+                    << "`";
+    return ynn_status_invalid_parameter;
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_input_tensor(const char* node, ynn_subgraph_t subgraph,
+                                 const char* name, uint32_t id, bool optional) {
+  if (optional && id == YNN_INVALID_VALUE_ID) {
+    return ynn_status_success;
+  }
+  if (!subgraph->is_valid_value(id)) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, tensor ID " << id
+                    << " is not valid for tensor `" << name << "`";
+    return ynn_status_invalid_parameter;
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_input_tensor_array(const char* node,
+                                       ynn_subgraph_t subgraph,
+                                       const char* name, size_t count,
+                                       const uint32_t* ids, bool allow_empty) {
+  if (!allow_empty && count == 0) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, input array `" << name
+                    << "` must be non-empty";
+    return ynn_status_invalid_parameter;
+  }
+  if (count > 0 && ids == nullptr) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, input array `" << name
+                    << "` must be non-null if count is " << count;
+    return ynn_status_invalid_parameter;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (!subgraph->is_valid_value(ids[i])) {
+      YNN_LOG_ERROR() << "For node `" << node << "`, tensor ID " << ids[i]
+                      << " is not valid for tensor `" << name << "[" << i
+                      << "]`";
+      return ynn_status_invalid_parameter;
+    }
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_output_tensor(const char* node, ynn_subgraph_t subgraph,
+                                  const char* name, uint32_t* id_out) {
+  if (id_out == nullptr) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, output `" << name
+                    << "` must be non-null";
+    return ynn_status_invalid_parameter;
+  }
+  if (*id_out != YNN_INVALID_VALUE_ID && !subgraph->is_valid_value(*id_out)) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, tensor ID " << *id_out
+                    << " is not valid for tensor `" << name << "`";
+    return ynn_status_invalid_parameter;
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_output_tensor_array(const char* node,
+                                        ynn_subgraph_t subgraph,
+                                        const char* name, size_t count,
+                                        uint32_t* ids_out, bool allow_empty) {
+  if (!allow_empty && count == 0) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, output array `" << name
+                    << "` must be non-empty";
+    return ynn_status_invalid_parameter;
+  }
+  if (count > 0 && ids_out == nullptr) {
+    YNN_LOG_ERROR() << "For node `" << node << "`, output array `" << name
+                    << "` must be non-null if count is " << count;
+    return ynn_status_invalid_parameter;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (ids_out[i] != YNN_INVALID_VALUE_ID &&
+        !subgraph->is_valid_value(ids_out[i])) {
+      YNN_LOG_ERROR() << "For node `" << node << "`, tensor ID " << ids_out[i]
+                      << " is not valid for tensor `" << name << "[" << i
+                      << "]`";
+      return ynn_status_invalid_parameter;
+    }
+  }
+  return ynn_status_success;
+}
+
+ynn_status validate_runtime(ynn_runtime_t runtime) {
+  if (runtime == nullptr) {
+    YNN_LOG_ERROR() << "runtime must be non-null";
+    return ynn_status_invalid_parameter;
+  }
+  return ynn_status_success;
+}
+
+}  // namespace ynn
+
+std::string ynn_value::name() const {
+  return name_prefix() + std::to_string(id);
+}
+
+ynn_status ynn_value::set_external_shape(size_t rank, const size_t* dims) {
+  if (!is_external_input()) {
+    YNN_LOG_ERROR() << "value " << id
+                    << " is not an external input, cannot set shape.";
+    return ynn_status_invalid_parameter;
+  }
+  assert(data);
+  if (this->rank() != rank) {
+    YNN_LOG_ERROR() << "new shape rank " << rank
+                    << " does not match existing rank " << this->rank();
+    return ynn_status_invalid_parameter;
+  }
+
+  size_t physical_dims[YNN_MAX_TENSOR_RANK];
+  ynn_status status = ynn::to_physical_shape(type, rank, dims, physical_dims);
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  for (int i = 0; i < rank; ++i) {
+    auto extent = slinky::as_constant(extents[rank - 1 - i]);
+    if (extent && *extent != dims[i]) {
+      YNN_LOG_ERROR() << "value " << id << " has fixed shape " << *extent
+                      << " in dimension " << i << " and cannot be reshaped to "
+                      << dims[i];
+      return ynn_status_invalid_parameter;
+    }
+  }
+
+  ynn::init_buffer(*data, ynn::type_size_bytes(type), rank, physical_dims,
+                   data->base);
+
+  for (size_t d = 0; d < rank; ++d) {
+    if (!extents[d].defined() || slinky::is_constant(extents[d], 1)) {
+      data->mutable_dim(d) = slinky::dim::broadcast();
+    }
+  }
+
+  return ynn_status_success;
+}
+
+ynn_status ynn_value::get_external_shape(size_t* rank, size_t* dims) const {
+  if (rank == nullptr) {
+    YNN_LOG_ERROR() << "rank pointer is null";
+    return ynn_status_invalid_parameter;
+  }
+  if (!data) {
+    YNN_LOG_ERROR() << "value " << id << " has no data buffer.";
+    return ynn_status_invalid_parameter;
+  }
+  if (*rank < data->rank) {
+    YNN_LOG_ERROR() << "ynn_get_external_value_shape called with rank ("
+                    << *rank << ") < value " << id << " rank (" << data->rank
+                    << ")";
+    return ynn_status_invalid_parameter;
+  }
+  *rank = data->rank;
+  for (size_t i = 0; i < *rank; ++i) {
+    dims[i] = data->dim(*rank - 1 - i).extent();
+  }
+  if (*rank > 0) {
+    dims[*rank - 1] *= ynn::type_element_count(type);
+  }
+  return ynn_status_success;
+}
+
+std::optional<ynn::real> ynn_value::as_scalar() const {
+  if (!is_static_scalar()) return std::nullopt;
+  switch (type) {
+    case ynn_type_fp64:
+      return static_cast<ynn::real>(static_scalar_value<double>());
+    case ynn_type_fp32:
+      return static_scalar_value<float>();
+    case ynn_type_fp16:
+      return static_scalar_value<ynn::half>();
+    case ynn_type_bf16:
+      return static_scalar_value<ynn::bfloat16>();
+    case ynn_type_int32:
+      return static_cast<ynn::real>(static_scalar_value<int32_t>());
+    case ynn_type_int8:
+      return static_cast<ynn::real>(static_scalar_value<int8_t>());
+    case ynn_type_uint8:
+      return static_cast<ynn::real>(static_scalar_value<uint8_t>());
+    case ynn_type_fp8_e5m2:
+      return static_cast<ynn::real>(static_scalar_value<ynn::fp8_e5m2>());
+    case ynn_type_fp8_e4m3:
+      return static_cast<ynn::real>(static_scalar_value<ynn::fp8_e4m3>());
+    case ynn_type_int4:
+    case ynn_type_uint4:
+    case ynn_type_int2:
+    case ynn_type_uint2:
+      // int4 & int2 values can't be scalars.
+    case ynn_type_invalid:
+      break;
+  }
+  return std::nullopt;
+}
+
+ynn_subgraph::ynn_subgraph(uint32_t external_value_ids, uint32_t flags)
+    : external_value_ids(external_value_ids), flags(flags) {
+  for (size_t i = 0; i < external_value_ids; ++i) {
+    values.push_back(ynn_value(i));
+  }
+}
+
+ynn_value& ynn_subgraph::new_internal_value(ynn_type type) {
+  ynn_value value;
+  value.id = values.size();
+  value.type = type;
+  values.push_back(std::move(value));
+  return values.back();
+}
+
+ynn_value& ynn_subgraph::get_output_value(uint32_t* output_id,
+                                          const ynn_value& template_value) {
+  return get_output_value(output_id, template_value.type);
+}
+
+ynn_value& ynn_subgraph::get_output_value(uint32_t* output_id, ynn_type type) {
+  if (*output_id == YNN_INVALID_VALUE_ID) {
+    ynn_value& new_output = new_internal_value();
+    new_output.type = type;
+    *output_id = new_output.id;
+    return new_output;
+  } else {
+    return value(*output_id);
+  }
+}
+
+void ynn_subgraph::add_node(ynn_node node) { nodes.push_back(std::move(node)); }
+
+const ynn_node* ynn_subgraph::get_producer(uint32_t id) const {
+  return const_cast<ynn_subgraph*>(this)->get_producer(id);
+}
+
+ynn_node* ynn_subgraph::get_producer(uint32_t id) {
+  if (id == YNN_INVALID_VALUE_ID) {
+    return nullptr;
+  }
+  for (ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    for (uint32_t i : node.outputs) {
+      if (i == id) {
+        return &node;
+      }
+    }
+  }
+  return nullptr;
+}
+
+size_t ynn_subgraph::count_consumers(uint32_t id) const {
+  if (id == YNN_INVALID_VALUE_ID) return 0;
+
+  size_t count = 0;
+  for (const ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    for (uint32_t i : node.inputs) {
+      if (i == id) {
+        ++count;
+      }
+    }
+  }
+
+  if (value(id).is_external_output()) {
+    // Treat external outputs as having a consumer.
+    ++count;
+  }
+
+  return count;
+}
+
+uint32_t ynn_subgraph::get_scalar_value_id(ynn_type type, float value_f32) {
+  return get_static_value_id(type, /*rank=*/0, /*dims=*/nullptr, &value_f32);
+}
+
+uint32_t ynn_subgraph::get_static_value_id(ynn_type type, size_t rank,
+                                           const size_t* dims,
+                                           float* value_f32) {
+  uint32_t id = YNN_INVALID_VALUE_ID;
+  ynn_define_tensor(this, type, rank, dims, value_f32,
+                    YNN_VALUE_FLAG_COPY_DATA_FP32, &id);
+  return id;
+}
+
+void ynn_subgraph::infer_elementwise_shape(ynn_node& node, int input_idx,
+                                           int output_idx, int input_dim,
+                                           int output_dim) {
+  const int input_id = node.inputs[input_idx];
+  if (input_id == YNN_INVALID_VALUE_ID) {
+    return;
+  }
+  const int output_id = node.outputs[output_idx];
+  const ynn_value& input = value(input_id);
+  if (input_dim >= input.extents.size()) {
+    // We allow implicit broadcasting of dimensions that don't exist on inputs.
+    return;
+  }
+  slinky::expr input_i = input.extents[input_dim];
+  if (!input_i.defined()) {
+    // This input is a broadcast, we don't learn anything from it.
+    return;
+  }
+  ynn_value& output = value(output_id);
+  assert(output_dim < output.extents.size());
+  slinky::expr& output_i = output.extents[output_dim];
+  if (output_i.defined()) {
+    // If we already have an extent here, it must match the new extent.
+    node.add_check(
+        output_i == input_i,
+        {"dimension ", output_dim, " (", output_i, ") of ",
+         ynn_node::output_idx{output_idx}, " does not match dimension ",
+         input_dim, " (", input_i, ") of ", ynn_node::input_idx{input_idx}});
+  }
+  if (!output_i.defined() || !as_constant(output_i)) {
+    // We don't have an extent, or it wasn't constant. Maybe the new extent is
+    // constant?
+    output_i = input_i;
+  }
+}
+
+namespace {
+
+template <typename C, typename T>
+std::optional<size_t> index_of(const C& container, const T& value) {
+  auto it = std::find(container.begin(), container.end(), value);
+  if (it == container.end()) {
+    return std::nullopt;
+  }
+  return static_cast<size_t>(std::distance(container.begin(), it));
+}
+
+size_t static_size_of_value(const ynn_value& value) {
+  size_t n = 1;
+  for (size_t i = 0; i < value.extents.size(); ++i) {
+    if (auto extent_c = as_constant(value.extent(i))) {
+      n *= *extent_c;
+    } else {
+      return 0;
+    }
+  }
+  return ynn::type_size_bytes(value.type, n);
+}
+
+size_t static_size_of_inputs(const ynn_subgraph& subgraph,
+                             const ynn_node& node) {
+  size_t size = 0;
+  for (uint32_t i : node.inputs) {
+    if (i == YNN_INVALID_VALUE_ID) continue;
+    const ynn_node* producer = subgraph.get_producer(i);
+    if (producer) {
+      size += static_size_of_inputs(subgraph, *producer);
+    } else {
+      size += static_size_of_value(subgraph.value(i));
+    }
+  }
+  return size;
+}
+
+bool should_constant_fold(const ynn_subgraph& subgraph, const ynn_node& node) {
+  if (std::holds_alternative<ynn_node::broadcast_like>(node.op) ||
+      std::holds_alternative<ynn_node::fuse_dim>(node.op) ||
+      std::holds_alternative<ynn_node::fuse_dims>(node.op) ||
+      std::holds_alternative<ynn_node::split_dim>(node.op) ||
+      std::holds_alternative<ynn_node::split_dims>(node.op) ||
+      std::holds_alternative<ynn_node::static_broadcast>(node.op) ||
+      std::holds_alternative<ynn_node::static_reshape>(node.op) ||
+      std::holds_alternative<ynn_node::static_transpose>(node.op)) {
+    // Don't constant fold these "free" ops. If we allowed them to constant
+    // fold and the heuristic below allowed it, it's possible we would produce
+    // two copies of the same value.
+    return false;
+  }
+
+  size_t size_of_inputs = static_size_of_inputs(subgraph, node);
+  size_t size_of_outputs = 0;
+  for (uint32_t i : node.outputs) {
+    if (i == YNN_INVALID_VALUE_ID) continue;
+    const ynn_value& value = subgraph.value(i);
+    size_t s = static_size_of_value(value);
+    size_of_outputs += s;
+  }
+
+  constexpr size_t small_constant_bytes = 64;
+  if (size_of_outputs < small_constant_bytes) {
+    // Always allow constant folding small constants.
+    return true;
+  } else if (size_of_outputs < size_of_inputs * 2) {
+    // Allow constant folding because the outputs are not too big compared to
+    // the inputs.
+    return true;
+  } else {
+    YNN_LOG_DEBUG() << "Not folding " << node.to_string() << " because the "
+                    << "outputs (" << size_of_outputs
+                    << " bytes) are significantly larger than the inputs ("
+                    << size_of_inputs << " bytes).";
+    return false;
+  }
+}
+
+// When caching folded constants, we need a cache key. To avoid the need to have
+// arbitrary producer graphs as cache keys, we only cache values that have a
+// single chain of producers, where each producer consumes either constants or
+// at most one other produced value. The following 3 structs define the 3 kinds
+// of inputs a producer may have.
+struct input_pointer {
+  ynn_type ynn_type_val = ynn_type_invalid;
+  std::array<slinky::index_t, ynn::max_tensor_rank> extents;
+  const void* pointer = nullptr;
+
+  bool operator==(const input_pointer& other) const {
+    return std::tie(ynn_type_val, extents, pointer) ==
+           std::tie(other.ynn_type_val, other.extents, other.pointer);
+  }
+  bool operator<(const input_pointer& other) const {
+    return std::tie(ynn_type_val, extents, pointer) <
+           std::tie(other.ynn_type_val, other.extents, other.pointer);
+  }
+};
+
+struct input_value {
+  ynn_type ynn_type_val = ynn_type_invalid;
+  std::array<slinky::index_t, ynn::max_tensor_rank> extents;
+  size_t value_hash = 0;
+
+  bool operator==(const input_value& other) const {
+    return std::tie(ynn_type_val, extents, value_hash) ==
+           std::tie(other.ynn_type_val, other.extents, other.value_hash);
+  }
+  bool operator<(const input_value& other) const {
+    return std::tie(ynn_type_val, extents, value_hash) <
+           std::tie(other.ynn_type_val, other.extents, other.value_hash);
+  }
+};
+
+struct input_producer {
+  // Which output of the producer produces this value.
+  size_t output_index = 0;
+
+  bool operator==(const input_producer& other) const {
+    return output_index == other.output_index;
+  }
+  bool operator<(const input_producer& other) const {
+    return output_index < other.output_index;
+  }
+};
+
+struct op_key {
+  decltype(ynn_node::op) op;
+  using input_key = std::variant<input_pointer, input_value, input_producer>;
+  std::vector<input_key> inputs;
+
+  bool operator==(const op_key& other) const {
+    return op == other.op && inputs == other.inputs;
+  }
+  bool operator<(const op_key& other) const {
+    return std::tie(op, inputs) < std::tie(other.op, other.inputs);
+  }
+};
+
+struct cache_key {
+  std::vector<op_key> producers;
+  size_t output_index;
+
+  bool operator==(const cache_key& other) const {
+    return output_index == other.output_index && producers == other.producers;
+  }
+  bool operator<(const cache_key& other) const {
+    return std::tie(output_index, producers) <
+           std::tie(other.output_index, other.producers);
+  }
+};
+
+bool build_chain(const ynn_subgraph& subgraph, uint32_t v_id,
+                 std::vector<op_key>& chain, size_t& output_index) {
+  const ynn_node* producer = subgraph.get_producer(v_id);
+  if (!producer) return false;
+
+  std::optional<size_t> idx = index_of(producer->outputs, v_id);
+  if (!idx) return false;
+  output_index = *idx;
+
+  op_key op_key;
+  op_key.op = producer->op;
+
+  uint32_t chain_input_id = YNN_INVALID_VALUE_ID;
+  int chain_inputs_count = 0;
+
+  for (uint32_t input_id : producer->inputs) {
+    if (input_id == YNN_INVALID_VALUE_ID) {
+      op_key.inputs.push_back(input_pointer{});
+      continue;
+    }
+
+    const ynn_node* producer = subgraph.get_producer(input_id);
+    if (!producer) {
+      const ynn_value& input = subgraph.value(input_id);
+      ynn_type type = input.type;
+      assert(input.data);
+      std::array<slinky::index_t, ynn::max_tensor_rank> extents;
+      extents.fill(1);
+      for (size_t d = 0; d < input.data->rank; ++d) {
+        extents[d] = input.data->dim(d).extent();
+      }
+
+      if (input.flags & YNN_VALUE_FLAG_COPY_DATA) {
+        // We made a copy of this value, so the pointer is not an identifier.
+        std::string_view view(static_cast<const char*>(input.data->base),
+                              input.data->size_bytes());
+        size_t value_hash = std::hash<std::string_view>{}(view);
+        op_key.inputs.push_back(input_value{type, extents, value_hash});
+      } else {
+        const void* pointer = input.data->base;
+        op_key.inputs.push_back(input_pointer{type, extents, pointer});
+      }
+    } else {
+      std::optional<size_t> output_index =
+          index_of(producer->outputs, input_id);
+      if (!output_index) return false;
+
+      op_key.inputs.push_back(input_producer{*output_index});
+
+      chain_input_id = input_id;
+      chain_inputs_count++;
+    }
+  }
+
+  if (chain_inputs_count > 1) {
+    // We only support caching values with one non-static input.
+    return false;
+  }
+
+  chain.push_back(op_key);
+
+  size_t dummy_output_index;
+  return chain_inputs_count == 0 ||
+         build_chain(subgraph, chain_input_id, chain, dummy_output_index);
+}
+
+bool build_cache_key(const ynn_subgraph& subgraph, uint32_t v_id,
+                     cache_key& key) {
+  key.producers.clear();
+  if (!build_chain(subgraph, v_id, key.producers, key.output_index)) {
+    return false;
+  }
+  std::reverse(key.producers.begin(), key.producers.end());
+  return true;
+}
+
+std::mutex constant_cache_mutex;  // NOLINT
+std::map<cache_key, std::weak_ptr<slinky::raw_buffer>> constant_cache;
+
+// constant_cache_mutex must be held when calling this function.
+slinky::raw_buffer_ptr lookup_constant(const cache_key& key) {
+  auto it = constant_cache.find(key);
+  if (it != constant_cache.end()) {
+    if (slinky::raw_buffer_ptr ptr = it->second.lock()) {
+      return ptr;
+    } else {
+      // The value was released by all subgraphs, we don't have it in the cache
+      // any more.
+      constant_cache.erase(it);
+    }
+  }
+  return nullptr;
+}
+
+// constant_cache_mutex must be held when calling this function.
+void insert_constant(const cache_key& key, slinky::raw_buffer_ptr& ptr) {
+  // This must tolerate writing multiple buffers to the same cache key, because
+  // graphs sometimes define multiple copies of the same computation, so within
+  // one subgraph, multiple constants map to the same cache key.
+  constant_cache[key] = ptr;
+}
+
+// `get_tensor_shape` needs a special case for constant folding, because we can
+// constant fold tensors with a constant extent, even if the data is not
+// constant.
+ynn_status fold_constant_get_tensor_shape(ynn_subgraph& subgraph) {
+  for (ynn_node& node : subgraph.nodes) {
+    if (!node.is_valid()) continue;
+    const auto* op = std::get_if<ynn_node::get_tensor_shape>(&node.op);
+    if (!op) continue;
+
+    assert(node.inputs.size() == 1);
+    const ynn_value& input = subgraph.value(node.inputs[0]);
+
+    if (ynn::any_n(input.rank(), [&](size_t i) {
+          return !slinky::as_constant(input.extent(i));
+        })) {
+      continue;
+    }
+
+    uint32_t output_id = node.outputs[0];
+    ynn_value& output = subgraph.value(output_id);
+
+    assert(output.rank() <= ynn::max_tensor_rank);
+    std::array<slinky::dim, ynn::max_tensor_rank> dims;
+    for (size_t d = 0; d < output.rank(); ++d) {
+      dims[d].set_min_extent(0, *slinky::as_constant(output.extent(d)));
+    }
+
+    output.data = slinky::raw_buffer::make(
+        output.rank(), ynn::type_size_bytes(output.type), dims.data(),
+        YNN_ALLOCATION_ALIGNMENT);
+
+    ynn::implement_get_tensor_shape(input.extents, op->axes, op->reshape_1d,
+                                    output.type, *output.data);
+
+    node.invalidate();
+  }
+  return ynn_status_success;
+}
+
+}  // namespace
+
+// Find parts of the graph that can be executed independently of any inputs.
+ynn_status ynn_subgraph::fold_constants(slinky::thread_pool* threadpool) {
+  // The number of nodes could be large, and we don't frequently read/write this
+  // vector, so using std::vector<bool> makes sense.
+  std::vector<bool> value_is_static(values.size(), false);
+
+  // 1. mark all values that are static by construction.
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    if (values[i].is_static()) {
+      assert(!values[i].is_external_output());
+      value_is_static[i] = true;
+    }
+  }
+
+  // 2. If a node has all static inputs, mark all of the outputs static as well.
+  std::vector<int> static_refs(values.size(), 0);
+  for (ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    if (std::any_of(node.inputs.begin(), node.inputs.end(), [&](uint32_t i) {
+          return i != YNN_INVALID_VALUE_ID && !value_is_static[i];
+        })) {
+      // This op has a non-static input.
+      continue;
+    }
+
+    if (std::any_of(node.outputs.begin(), node.outputs.end(), [&](uint32_t i) {
+          return i != YNN_INVALID_VALUE_ID && values[i].is_external_output();
+        })) {
+      // This op has an external output, so it is not constant folded.
+      continue;
+    }
+
+    // Count references to the static inputs.
+    for (uint32_t i : node.inputs) {
+      if (i == YNN_INVALID_VALUE_ID) continue;
+      static_refs[i]++;
+    }
+
+    // Mark outputs static.
+    for (uint32_t i : node.outputs) {
+      if (i == YNN_INVALID_VALUE_ID) continue;
+      value_is_static[i] = true;
+    }
+  }
+
+  // 3. Un-mark values as static if they are produced by "cheap" ops and not
+  // needed by another folded op. We go in reverse order to find ops we should
+  // not fold transitively.
+  for (auto i = nodes.rbegin(); i != nodes.rend(); ++i) {
+    ynn_node& node = *i;
+    if (!node.is_valid()) continue;
+
+    if (std::any_of(node.outputs.begin(), node.outputs.end(), [&](uint32_t i) {
+          return i != YNN_INVALID_VALUE_ID && !value_is_static[i];
+        })) {
+      // This op is not constant folded.
+      continue;
+    }
+
+    if (std::any_of(node.outputs.begin(), node.outputs.end(), [&](uint32_t i) {
+          return i != YNN_INVALID_VALUE_ID && static_refs[i] != 0;
+        })) {
+      // This cheap op is still needed by another folded op.
+      continue;
+    }
+
+    if (should_constant_fold(*this, node)) continue;
+
+    // Drop references to the static inputs.
+    for (uint32_t i : node.inputs) {
+      if (i == YNN_INVALID_VALUE_ID) continue;
+      assert(static_refs[i] > 0);
+      static_refs[i]--;
+    }
+
+    // Mark the outputs as not static.
+    for (uint32_t i : node.outputs) {
+      if (i == YNN_INVALID_VALUE_ID) continue;
+      value_is_static[i] = false;
+      assert(static_refs[i] == 0);
+    }
+  }
+
+  // 3. Move the static values and their producers to a different subgraph that
+  // we can evaluate.
+  std::set<uint32_t> to_fold;
+  slinky::ref_count<ynn_subgraph> constants = new ynn_subgraph(*this);
+  for (uint32_t i = 0; i < nodes.size(); ++i) {
+    ynn_node& node = nodes[i];
+    if (!node.is_valid()) continue;
+
+    if (std::all_of(node.outputs.begin(), node.outputs.end(), [&](uint32_t i) {
+          return i == YNN_INVALID_VALUE_ID || value_is_static[i];
+        })) {
+      // Fold this node.
+      for (uint32_t i : node.outputs) {
+        if (i == YNN_INVALID_VALUE_ID) continue;
+        to_fold.insert(i);
+      }
+      // Remove the node from the subgraph.
+      node.invalidate();
+    } else {
+      // Remove the node (and its outputs) from the constant subgraph.
+      for (uint32_t i : node.outputs) {
+        if (i == YNN_INVALID_VALUE_ID) continue;
+        constants->values[i].invalidate();
+      }
+      constants->nodes[i].invalidate();
+    }
+  }
+
+  // Find which constant values are actually needed by the remaining active
+  // nodes of the main subgraph.
+  std::set<uint32_t> needed_constants;
+  for (const ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    for (uint32_t i : node.inputs) {
+      if (i != YNN_INVALID_VALUE_ID && to_fold.count(i)) {
+        needed_constants.insert(i);
+      }
+    }
+  }
+
+  if (needed_constants.empty()) {
+    return ynn_status_success;
+  }
+
+  // Cache lookup.
+  std::map<uint32_t, cache_key> keys;
+  std::map<uint32_t, slinky::raw_buffer_ptr> cached_values;
+
+  // From here, we need to serialize constant folding, to avoid racily folding
+  // the same constant twice.
+  std::lock_guard<std::mutex> lock(constant_cache_mutex);  // NOLINT
+  for (uint32_t i : needed_constants) {
+    cache_key key;
+    // Build key using constants subgraph because it has folded nodes intact.
+    if (build_cache_key(*constants, i, key)) {
+      keys[i] = key;
+      slinky::raw_buffer_ptr cached_ptr = lookup_constant(key);
+      if (cached_ptr) {
+        YNN_LOG_DEBUG() << "Constant cache hit for value " << i;
+        cached_values[i] = cached_ptr;
+      }
+    }
+  }
+
+  // Put cached values in constants subgraph.
+  for (auto& [i, cached_ptr] : cached_values) {
+    constants->values[i].data = cached_ptr;
+    // Invalidate producer in constants
+    ynn_node* producer = constants->get_producer(i);
+    if (producer) {
+      producer->invalidate();
+    }
+  }
+
+  // Mark these values as external outputs in `constants` so we can reshape and
+  // learn the shape of the constants.
+  for (uint32_t i : needed_constants) {
+    if (!cached_values.count(i)) {
+      constants->values[i].flags |= YNN_VALUE_FLAG_EXTERNAL_OUTPUT;
+    }
+  }
+
+  constants->invalidate_dead_values();
+
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+  YNN_LOG_DEBUG() << "constant subgraph:\n";
+  constants->dump(std::cout);
+#endif
+
+  ynn_runtime runtime(constants, threadpool, 0);
+  ynn_status status = runtime.build();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  status = runtime.reshape();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  // Use the results of reshape to allocate static buffers for the constants.
+  for (uint32_t i : needed_constants) {
+    ynn_runtime_value& folded = runtime.value(i);
+    assert(folded.data);
+    assert(values[i].extents.size() == folded.data->rank);
+    for (size_t d = 0; d < folded.data->rank; ++d) {
+      slinky::index_t extent = folded.data->dim(d).extent();
+      if (d == 0) {
+        extent *= ynn::type_element_count(values[i].type);
+      }
+      values[i].extents[d] = extent;
+    }
+    if (cached_values.count(i)) {
+      values[i].data = folded.data;
+    } else {
+      // Make a new value to put the constant in.
+      values[i].data =
+          slinky::raw_buffer::make(folded.data->rank, folded.data->elem_size,
+                                   folded.data->dims, YNN_ALLOCATION_ALIGNMENT);
+      // Use the new value as the output of the constant folding runtime.
+      folded.data = values[i].data;
+    }
+  }
+
+  status = runtime.setup();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  status = runtime.invoke();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  // Insert newly folded constants into cache.
+  for (uint32_t i : needed_constants) {
+    if (cached_values.count(i)) continue;
+    auto it = keys.find(i);
+    if (it != keys.end()) {
+      insert_constant(it->second, values[i].data);
+    }
+  }
+
+  return ynn_status_success;
+}
+
+void ynn_subgraph::invalidate_dead_values() {
+  std::vector<int> value_uses(values.size(), 0);
+
+  // Count all the consumers of values.
+  for (ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    for (uint32_t i : node.inputs) {
+      if (i == YNN_INVALID_VALUE_ID) continue;
+      value_uses[i]++;
+    }
+  }
+
+  // Count external values as used.
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (values[i].is_valid() && values[i].is_external()) {
+      value_uses[i]++;
+    }
+  }
+
+  // Going in reverse order, remove dead nodes, and discount the uses of the
+  // inputs to newly dead nodes.
+  for (auto i = nodes.rbegin(); i != nodes.rend(); ++i) {
+    ynn_node& node = *i;
+    if (!node.is_valid()) continue;
+    bool dead =
+        std::all_of(node.outputs.begin(), node.outputs.end(), [&](uint32_t i) {
+          return i == YNN_INVALID_VALUE_ID || value_uses[i] == 0;
+        });
+    if (dead) {
+      for (uint32_t i : node.inputs) {
+        if (i == YNN_INVALID_VALUE_ID) continue;
+        value_uses[i]--;
+      }
+      node.invalidate();
+    }
+  }
+
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (values[i].is_valid() && value_uses[i] == 0) {
+      values[i].invalidate();
+    }
+  }
+}
+
+namespace {
+
+bool outputs_are_compatible(const ynn_subgraph& subgraph,
+                            const std::vector<uint32_t>& a_outputs,
+                            const std::vector<uint32_t>& b_outputs) {
+  if (a_outputs.size() != b_outputs.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a_outputs.size(); ++i) {
+    if (a_outputs[i] == YNN_INVALID_VALUE_ID) continue;
+    if (b_outputs[i] == YNN_INVALID_VALUE_ID) continue;
+    const ynn_value& a_output = subgraph.value(a_outputs[i]);
+    const ynn_value& b_output = subgraph.value(b_outputs[i]);
+
+    if (a_output.type != b_output.type) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+ynn_status ynn_subgraph::eliminate_common_subgraphs() {
+  // We characterize a node as unique by its combination of inputs and its op.
+  using key_type = std::pair<std::vector<uint32_t>, decltype(ynn_node::op)>;
+  // `seen_ops` keeps track of the nodes we've already seen. Map key is the node
+  // signature, map value is a list of output value ids from previously seen
+  // nodes with the same signature. It is possible for multiple ops to have the
+  // same signature, hence the vector of vectors.
+  std::map<key_type, std::vector<std::vector<uint32_t>>> seen_ops;
+
+  // `replacements` is used to replace the output of a node with the output of
+  // a previously seen node. Initially, every value maps to itself.
+  std::vector<uint32_t> replacements(values.size());
+  std::iota(replacements.begin(), replacements.end(), 0);
+
+  for (ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+
+    // If an input to the current node was previously determined redundant,
+    // update it with the replaced value id.
+    for (uint32_t& input : node.inputs) {
+      if (input != YNN_INVALID_VALUE_ID) {
+        input = replacements[input];
+      }
+    }
+
+    // If the node produces an external output, we don't want to replace it in
+    // order to preserve the graph's public interface.
+    const bool produces_external_output = std::any_of(
+        node.outputs.begin(), node.outputs.end(), [this](uint32_t i) {
+          return i != YNN_INVALID_VALUE_ID && values[i].is_external_output();
+        });
+    const key_type key = {node.inputs, node.op};
+    if (produces_external_output) {
+      seen_ops[key].push_back(node.outputs);
+      continue;
+    }
+
+    bool matched = false;
+    // Check if the node matches any previously seen node.
+    // If so, replace the outputs of this node with the outputs of the
+    // existing node.
+    for (const std::vector<uint32_t>& existing_outputs : seen_ops[key]) {
+      assert(existing_outputs.size() == node.outputs.size());
+      if (outputs_are_compatible(*this, node.outputs, existing_outputs)) {
+        // We found a duplicate node. Replace the outputs of this node with
+        // the outputs of the existing node.
+        for (size_t i = 0; i < node.outputs.size(); ++i) {
+          if (node.outputs[i] != YNN_INVALID_VALUE_ID) {
+            replacements[node.outputs[i]] = existing_outputs[i];
+          }
+        }
+        node.invalidate();
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      seen_ops[key].push_back(node.outputs);
+    }
+  }
+
+  return ynn_status_success;
+}
+
+void ynn_subgraph::topological_sort() {
+  std::vector<bool> value_ready(values.size(), false);
+  for (uint32_t i = 0; i < values.size(); ++i) {
+    if (values[i].is_external_input() || values[i].is_static()) {
+      value_ready[i] = true;
+    }
+  }
+
+  // This topological sort implementation would be inefficient if the nodes were
+  // not already mostly sorted.
+  size_t begin = 0;
+  size_t invalid_count = 0;
+  bool changed;
+  do {
+    changed = false;
+    for (size_t i = begin; i < nodes.size(); ++i) {
+      if (!nodes[i].is_valid()) {
+        ++invalid_count;
+        continue;
+      }
+
+      const bool node_is_ready = std::all_of(
+          nodes[i].inputs.begin(), nodes[i].inputs.end(), [&](uint32_t id) {
+            return id == YNN_INVALID_VALUE_ID || value_ready[id];
+          });
+
+      if (!node_is_ready) continue;
+
+      if (i > begin) {
+        std::rotate(nodes.begin() + begin, nodes.begin() + i,
+                    nodes.begin() + i + 1);
+      }
+      for (uint32_t output_id : nodes[begin].outputs) {
+        if (output_id != YNN_INVALID_VALUE_ID) {
+          value_ready[output_id] = true;
+        }
+      }
+      begin++;
+      changed = true;
+    }
+  } while (changed && begin < nodes.size());
+
+  if (begin + invalid_count < nodes.size()) {
+    YNN_LOG_WARNING()
+        << "Failed to topologically sort subgraph; graph may have "
+           "cycles.";
+  }
+
+  nodes.resize(begin);
+}
+
+ynn_status ynn_subgraph::optimize(slinky::thread_pool* threadpool) {
+  ynn_status status;
+
+  status = fold_constant_get_tensor_shape(*this);
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  status = fusion();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  status = fold_constants(threadpool);
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  status = eliminate_common_subgraphs();
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+  invalidate_dead_values();
+
+  return ynn_status_success;
+}
+
+namespace {
+
+const char* name_of(const ynn_node::invalid&) { return "invalid"; }
+const char* name_of(const ynn_node::opaque&) { return "opaque"; }
+const char* name_of(const ynn_node::unary_elementwise&) {
+  return "unary_elementwise";
+}
+
+const char* name_of(const ynn_node::binary_elementwise&) {
+  return "binary_elementwise";
+}
+const char* name_of(const ynn_node::ternary_elementwise&) {
+  return "ternary_elementwise";
+}
+const char* name_of(const ynn_node::reduce&) { return "reduce"; }
+const char* name_of(const ynn_node::broadcast_like&) {
+  return "broadcast_like";
+}
+const char* name_of(const ynn_node::concatenate&) { return "concatenate"; }
+const char* name_of(const ynn_node::stack&) { return "stack"; }
+const char* name_of(const ynn_node::even_split&) { return "even_split"; }
+const char* name_of(const ynn_node::copy&) { return "copy"; }
+const char* name_of(const ynn_node::gather&) { return "gather"; }
+const char* name_of(const ynn_node::fuse_dim&) { return "fuse_dim"; }
+const char* name_of(const ynn_node::fuse_dims&) { return "fuse_dims"; }
+const char* name_of(const ynn_node::split_dim&) { return "split_dim"; }
+const char* name_of(const ynn_node::split_dims&) { return "split_dims"; }
+const char* name_of(const ynn_node::static_reshape&) {
+  return "static_reshape";
+}
+const char* name_of(const ynn_node::static_broadcast&) {
+  return "static_broadcast";
+}
+const char* name_of(const ynn_node::static_pad&) { return "static_pad"; }
+const char* name_of(const ynn_node::static_slice&) { return "static_slice"; }
+const char* name_of(const ynn_node::slice_like&) { return "slice_like"; }
+const char* name_of(const ynn_node::static_transpose&) {
+  return "static_transpose";
+}
+const char* name_of(const ynn_node::stencil_copy&) { return "stencil_copy"; }
+const char* name_of(const ynn_node::dot&) { return "dot"; }
+const char* name_of(const ynn_node::iota&) { return "iota"; }
+const char* name_of(const ynn_node::pack_b&) { return "pack_b"; }
+const char* name_of(const ynn_node::transpose_a&) { return "transpose_a"; }
+const char* name_of(const ynn_node::dequantize_dot&) {
+  return "dequantize_dot";
+}
+const char* name_of(const ynn_node::dynamic_quantization&) {
+  return "dynamic_quantization";
+}
+const char* name_of(const ynn_node::get_tensor_shape&) {
+  return "get_tensor_shape";
+}
+
+using ynn::operator<<;  // NOLINT(misc-unused-using-decls)
+
+std::ostream& operator<<(std::ostream& os,
+                         const ynn_node::split_dims::split& new_dim) {
+  os << "{axis=" << new_dim.axis << ",factor=" << new_dim.factor << "}";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         const ynn_node::static_pad::padding& padding) {
+  os << "{axis=" << padding.axis << ",pre_padding=" << padding.pre_padding
+     << ",post_padding=" << padding.post_padding << "}";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         const ynn_node::stencil_copy::stencil& stencil) {
+  os << "{axis=" << stencil.axis << ",new_axis=" << stencil.new_axis
+     << ",extent=" << stencil.extent << ",stride=" << stencil.stride
+     << ",dilation=" << stencil.dilation << "}";
+  return os;
+}
+
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
+  os << "{";
+  const char* sep = "";
+  for (const T& v : vec) {
+    os << sep << v;
+    sep = ",";
+  }
+  os << "}";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const ynn::axes_set& axes) {
+  os << "{";
+  const char* sep = "";
+  for (size_t i = 0; i < axes.size(); ++i) {
+    if (axes[i]) {
+      os << sep << i;
+      sep = ",";
+    }
+  }
+  os << "}";
+  return os;
+}
+
+void print(std::ostream& os, const ynn_node::invalid&) { YNN_UNREACHABLE; }
+
+void print(std::ostream& os, const ynn_node::opaque& op) {
+  if (op.name) {
+    os << op.name;
+  }
+}
+
+void print(std::ostream& os, const ynn_node::unary_elementwise& op) {
+  os << "op=" << op.op;
+}
+
+void print(std::ostream& os, const ynn_node::binary_elementwise& op) {
+  os << "op=" << op.op;
+}
+
+void print(std::ostream& os, const ynn_node::ternary_elementwise& op) {
+  os << "op=" << op.op;
+}
+
+void print(std::ostream& os, const ynn_node::reduce& op) {
+  os << "op=" << op.op << " axes=" << op.k_dims;
+  if (op.keep_dims) {
+    os << " keep_dims";
+  }
+}
+
+void print(std::ostream& os, const ynn_node::broadcast_like& op) {
+  os << "axes=" << op.axes;
+}
+
+void print(std::ostream& os, const ynn_node::concatenate& op) {
+  os << "axis=" << op.axis;
+}
+
+void print(std::ostream& os, const ynn_node::stack& op) {
+  os << "axis=" << op.axis;
+}
+
+void print(std::ostream& os, const ynn_node::even_split& op) {
+  os << "axis=" << op.axis;
+}
+
+void print(std::ostream& os, const ynn_node::copy& op) { os << "copy"; }
+void print(std::ostream& os, const ynn_node::gather& op) {
+  os << "axes=" << op.axes;
+}
+
+void print(std::ostream& os, const ynn_node::fuse_dim& op) {
+  os << "axis=" << op.axis << " axes_count=" << op.axes_count;
+}
+
+void print(std::ostream& os, const ynn_node::fuse_dims& op) {
+  os << "axes=" << op.axes;
+}
+
+void print(std::ostream& os, const ynn_node::split_dim& op) {
+  os << "axis=" << op.axis << " " << op.new_dims;
+}
+
+void print(std::ostream& os, const ynn_node::split_dims& op) {
+  os << "splits=" << op.splits;
+}
+
+void print(std::ostream& os, const ynn_node::static_reshape& op) {
+  os << "new_dims=" << op.new_dims;
+}
+
+void print(std::ostream& os, const ynn_node::static_broadcast& op) {
+  os << "new_dims=" << op.new_dims;
+}
+
+void print(std::ostream& os, const ynn_node::static_pad& op) {
+  os << "paddings=" << op.paddings;
+}
+
+void print(std::ostream& os, const ynn_node::static_slice& op) {
+  os << "slices={";
+  for (size_t i = 0; i < op.slices.size(); ++i) {
+    const ynn_node::static_slice::slice& slice = op.slices[i];
+    if (op.slice_dims) {
+      os << "{axis=" << slice.axis << ",at=" << slice.begin << "}";
+    } else {
+      os << "{axis=" << slice.axis << ",begin=" << slice.begin
+         << ",end=" << slice.end << ",stride=" << slice.stride << "}";
+    }
+    if (i + 1 < op.slices.size()) {
+      os << ",";
+    }
+  }
+  os << "}";
+}
+
+void print(std::ostream& os, const ynn_node::slice_like& op) {
+  os << "axes=" << op.axes;
+}
+
+void print(std::ostream& os, const ynn_node::static_transpose& op) {
+  os << "permutation=" << op.permutation;
+  if (op.alias) {
+    os << " alias";
+  }
+}
+
+void print(std::ostream& os, const ynn_node::stencil_copy& op) {
+  os << "stencils=" << op.stencils;
+}
+
+void print(std::ostream& os, const ynn_node::dot& op) {
+  os << "num_k_dims=" << op.num_k_dims;
+}
+
+void print(std::ostream& os, const ynn_node::iota& op) {}
+
+void print(std::ostream& os, const ynn_node::pack_b& op) {}
+void print(std::ostream& os, const ynn_node::transpose_a& op) {
+  os << "tile_m=" << op.tile_m << " tile_k=" << op.tile_k
+     << " m_dim=" << op.m_dim;
+}
+
+void print(std::ostream& os, const ynn_node::dequantize_dot& op) {}
+void print(std::ostream& os, const ynn_node::dynamic_quantization& op) {
+  os << "output_zero_point=" << op.output_zero_point;
+}
+
+void print(std::ostream& os, const ynn_node::get_tensor_shape& op) {
+  os << "axes=" << op.axes;
+  if (op.reshape_1d) {
+    os << " reshape_1d";
+  }
+}
+
+std::string value_ids_to_string(const std::vector<uint32_t>& value_ids) {
+  std::stringstream ss;
+  ss << "{";
+  const char* sep = "";
+  for (uint32_t value_id : value_ids) {
+    ss << sep;
+    if (value_id != YNN_INVALID_VALUE_ID) {
+      ss << value_id;
+    }
+    sep = ",";
+  }
+  ss << "}";
+  return ss.str();
+}
+
+}  // namespace
+
+const char* ynn_node::name() const {
+  return std::visit([&](const auto& op) { return name_of(op); }, op);
+}
+
+std::string ynn_node::to_string() const {
+  std::stringstream ss;
+  ss << name() << " ";
+  std::visit([&](const auto& op) { print(ss, op); }, op);
+  return ss.str();
+}
+
+void ynn_node::add_check(slinky::expr condition,
+                         std::vector<check::message_part> message) {
+  condition = slinky::simplify(condition);
+  if (!slinky::is_true(condition)) {
+    checks.push_back({std::move(condition), std::move(message)});
+  }
+}
+
+void ynn_subgraph::dump(std::ostream& os) const {
+  // Values header.
+  constexpr int id_width = 10;
+  constexpr int rank_width = 4;
+  constexpr int type_width = 6;
+  os << std::setw(id_width) << "value id" << " ";
+  os << std::setw(rank_width) << "rank" << " ";
+  os << std::setw(type_width) << "type" << std::endl;
+
+  os << std::string(id_width, '-') << " ";
+  os << std::string(rank_width, '-') << " ";
+  os << std::string(type_width, '-') << std::endl;
+
+  // Values
+  int values_count = 0;
+  for (const ynn_value& value : values) {
+    if (!value.is_valid()) continue;
+    os << std::setw(id_width) << value.id << " ";
+    os << std::setw(rank_width) << value.rank() << " ";
+    os << std::setw(type_width) << value.type << " ";
+    if (value.flags & YNN_VALUE_FLAG_EXTERNAL_OUTPUT) {
+      os << "external_output ";
+    }
+    if (value.flags & YNN_VALUE_FLAG_EXTERNAL_INPUT) {
+      os << "external_input ";
+    }
+    if (value.is_static()) {
+      os << "static ";
+      if (auto v = value.as_scalar()) {
+        os << "value=" << *v << " ";
+      }
+    }
+    os << "extents={";
+    for (const slinky::expr& i : value.extents) {
+      if (!i.defined()) {
+        os << 1;
+      } else if (const auto v = as_constant(i)) {
+        os << *v;
+      } else {
+        os << i;
+        // os << "?";
+      }
+      os << ",";
+    }
+    os << "}";
+    os << std::endl;
+    ++values_count;
+  }
+
+  // Nodes header
+  const int inputs_width = (std::ceil(std::log10(values.size())) + 1) * 6 + 3;
+  constexpr int outputs_width = 10;
+  os << std::setw(inputs_width) << "node inputs" << " ";
+  os << std::setw(outputs_width) << "outputs" << std::endl;
+  os << std::string(inputs_width, '-') << " ";
+  os << std::string(outputs_width, '-') << std::endl;
+
+  // Nodes
+  int nodes_count = 0;
+  for (const ynn_node& node : nodes) {
+    if (!node.is_valid()) continue;
+    os << std::setw(inputs_width) << value_ids_to_string(node.inputs) << " ";
+    os << std::setw(outputs_width) << value_ids_to_string(node.outputs) << " ";
+    os << node.to_string() << std::endl;
+    ++nodes_count;
+  }
+  os << "subgraph contains " << values_count << " values and " << nodes_count
+     << " nodes." << std::endl;
+}
+
+extern "C" {
+
+ynn_status ynn_create_subgraph(uint32_t external_value_ids, uint32_t flags,
+                               ynn_subgraph_t* subgraph) {
+  if (subgraph == nullptr) {
+    YNN_LOG_ERROR() << "output subgraph must be non-null";
+    return ynn_status_invalid_parameter;
+  }
+  *subgraph = new ynn_subgraph(external_value_ids, flags);
+  (*subgraph)->add_ref();
+  return ynn_status_success;
+}
+
+ynn_status ynn_optimize_subgraph(ynn_subgraph_t subgraph,
+                                 ynn_threadpool_t threadpool, uint32_t flags) {
+  if (subgraph == nullptr) {
+    YNN_LOG_ERROR() << "subgraph must be non-null";
+    return ynn_status_invalid_parameter;
+  }
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_DEBUG
+  YNN_LOG_DEBUG() << "subgraph before optimization:\n";
+  subgraph->dump(std::cout);
+#endif
+
+  slinky::thread_pool* slinky_threadpool =
+      reinterpret_cast<slinky::thread_pool*>(threadpool);
+  ynn_status status = subgraph->optimize(slinky_threadpool);
+  if (status != ynn_status_success) {
+    return status;
+  }
+
+#if YNN_LOG_LEVEL >= YNN_LOG_LEVEL_INFO
+  YNN_LOG_INFO() << "subgraph after optimization:\n";
+  subgraph->dump(std::cout);
+#endif
+
+  return ynn_status_success;
+}
+
+void ynn_delete_subgraph(ynn_subgraph_t subgraph) {
+  if (subgraph) subgraph->release();
+}
+
+}  // extern "C"

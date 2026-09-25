@@ -1,0 +1,191 @@
+// Copyright 2025 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#ifndef XNNPACK_YNNPACK_KERNELS_DOT_DOT_H_
+#define XNNPACK_YNNPACK_KERNELS_DOT_DOT_H_
+
+#include <cstddef>
+#include <cstdint>  // IWYU pragma: keep
+#include <limits>
+#include <optional>
+
+#include "ynnpack/base/arch.h"  // IWYU pragma: keep
+#include "ynnpack/base/base.h"  // IWYU pragma: keep
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/kernels/dot/arm64_sme.h"  // IWYU pragma: keep
+
+namespace ynn {
+
+// `enum class` doesn't work well for bitfield values.
+namespace dot_flag {
+
+enum {
+  // The `a` parameter of the dot must be transposed from [i, k3, k2, k1]
+  // to [k1 / tile_k, k3, k2, {i, tile_k}], where:
+  // - The {i, tile_k} dimension is dense (stride of 1 element).
+  // - `a_stride_m` indicates the stride of the k1 / tile_k dimension.
+  transpose_a = 1 << 0,
+
+  // This kernel produces results that are numerically consistent with all other
+  // kernels of the same type with this flag. For the most part,
+  // fp32 `tile_k = 1` kernels to be numerically consistent, and bf16/fp16
+  // `tile_k = 2` kernels to be numerically consistent for bf16 and fp16.
+  consistent_arithmetic = 1 << 1,
+
+  // This kernel supports an unaligned B
+  unaligned_b = 1 << 2,
+
+  // This kernel assumes that the values in B do not include the most negative
+  // value, i.e. -b does not overflow.
+  symmetric_b = 1 << 3,
+};
+
+}  // namespace dot_flag
+
+// Generic stack storage for kernel-specific execution state (e.g. AMX
+// configuration). Kernels should set the `destroy` function if they allocate
+// resources that need to be freed when the state is destroyed.
+struct dot_kernel_state {
+  using destroy_fn = void (*)(dot_kernel_state*);
+  destroy_fn destroy = nullptr;
+
+  static constexpr size_t kStorageAlignment = 64;
+  static constexpr size_t kStorageSize = 64;
+
+  alignas(kStorageAlignment) std::byte storage[kStorageSize] = {};
+
+  dot_kernel_state() = default;
+  ~dot_kernel_state() {
+    if (destroy) {
+      destroy(this);
+    }
+  }
+
+  dot_kernel_state(const dot_kernel_state&) = delete;
+  dot_kernel_state(dot_kernel_state&&) = delete;
+  dot_kernel_state& operator=(const dot_kernel_state&) = delete;
+  dot_kernel_state& operator=(dot_kernel_state&&) = delete;
+
+  template <typename T>
+  T* as() {
+    static_assert(sizeof(T) <= kStorageSize);
+    static_assert(kStorageAlignment >= alignof(T));
+    return reinterpret_cast<T*>(storage);
+  }
+
+  template <typename T>
+  const T* as() const {
+    static_assert(sizeof(T) <= kStorageSize);
+    static_assert(kStorageAlignment >= alignof(T));
+    return reinterpret_cast<const T*>(storage);
+  }
+};
+
+// Dot kernels compute the following:
+//
+//    C_out(i, j) = 0
+//    C_out(i, j) += A(i, k3, k2, k1) * B(k3, k2, k1, j)
+//    C_out(i, j) += C_in(i, j)
+//
+// for all i, j, k3, k2, k1
+typedef void (*dot_kernel_fn)(size_t m, size_t n, size_t k3, size_t k2,
+                              size_t k1, size_t a_stride_m, size_t a_stride_k3,
+                              size_t a_stride_k2, const void* a,
+                              size_t b_stride_k3, size_t b_stride_k2,
+                              size_t b_stride_k1, const void* b,
+                              size_t c_in_stride_m, const void* c_in,
+                              size_t c_out_stride_m, void* c_out,
+                              dot_kernel_state* state);
+
+#define YNN_DOT_KERNEL(arch, name, block_m, block_n, block_k, tile_m, tile_n, \
+                       tile_k, transpose_a, type_a, type_b, type_c)           \
+  void name(size_t m, size_t n, size_t k3, size_t k2, size_t k1,              \
+            size_t a_stride_m, size_t a_stride_k3, size_t a_stride_k2,        \
+            const void* a, size_t b_stride_k3, size_t b_stride_k2,            \
+            size_t b_stride_k1, const void* b, size_t c_in_stride_m,          \
+            const void* c_in, size_t c_out_stride_m, void* c_out,             \
+            dot_kernel_state* state = nullptr);
+#include "ynnpack/kernels/dot/kernels.inc"
+#undef YNN_DOT_KERNEL
+
+struct dot_type {
+  ynn_type a;
+  ynn_type b;
+  ynn_type c;
+};
+
+// A dot kernel is a function pointer, along with information about the block
+// shape.
+struct dot_kernel {
+  dot_kernel_fn kernel = nullptr;
+  // Dot kernels have two shapes that callers must be aware of:
+  // - The "tile shape", which is the minimal element of work that the kernel
+  // can compute. Work that is not aligned to this shape will be padded up to
+  // this shape.
+  // - The "block shape", which is an unrolling in all 3 dimensions of the tile
+  // shape.
+  //
+  // Key impacts of this on calling code of these kernels:
+  // - `m` must not be larger than `block_m`. Call the kernel in a loop to
+  // handle this case.
+  // - `n` can be anything, but performance may be sub-optimal if not aligned to
+  // a multiple of `block_n` and/or `tile_n`.
+  // - `tile_k` values of B must be contiguous in memory, i.e. `tile_k = K`
+  // indicates that `K` rows of B should be interleaved at a time, such that
+  // values from `K` rows of B are adjacent in memory.
+  // - Kernels often assume that the memory of B is aligned such that the each
+  // tile beings on a memory address aligned to the size of the tile.
+  int block_m : 8;
+  int block_n : 8;
+  int block_k : 8;
+  int tile_m : 8;
+  int tile_n : 8;
+  int tile_k : 8;
+  uint32_t flags;
+  float cost = std::numeric_limits<float>::infinity();
+
+  // If not specifically known, this is the maximum `block_n` value that could
+  // be returned by another compatible call to `get_dot_kernel`.
+  int max_block_n;
+};
+
+// If we don't know the shape of a dot, just assume it's big.
+inline constexpr size_t unknown_dot_extent = 2048;
+
+struct dot_shape {
+  size_t m = unknown_dot_extent;
+  size_t n = unknown_dot_extent;
+  size_t k1 = unknown_dot_extent;
+  size_t k2 = unknown_dot_extent;
+  size_t k3 = unknown_dot_extent;
+};
+
+// Compute an estimate of the cost of a dot operation. This number has no
+// absolute meaning, it is only comparable to other return values of this
+// function.
+float estimate_dot_cost(size_t m, size_t n, size_t k, uint32_t block_m,
+                        uint32_t block_n, uint32_t block_k, uint32_t tile_m,
+                        uint32_t tile_n, uint32_t tile_k,
+                        uint32_t b_elem_count = 1);
+
+struct dot_packed_shape {
+  int block_n = 0;
+  int tile_k = 0;
+};
+
+// Find a dot kernel to use for the given `shape`. If not null, the chosen
+// kernel will have the same `tile_n` and `tile_k` as `compatible_with` (i.e.
+// both kernels can use the same packed data.). Similarly, if `transpose_a` is
+// not `nullopt`, the chosen kernel will have the flag `dot_flag::transpose_a`
+// if *transpose_a is true.
+dot_kernel get_dot_kernel(const dot_type& type, const dot_shape& shape = {},
+                          dot_packed_shape dot_packed_shape = {},
+                          uint32_t required_flags = 0,
+                          std::optional<bool> transpose_a = std::nullopt,
+                          uint64_t arch_flags = get_supported_arch_flags());
+
+}  // namespace ynn
+
+#endif  // XNNPACK_YNNPACK_KERNELS_DOT_DOT_H_

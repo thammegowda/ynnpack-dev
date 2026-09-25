@@ -1,0 +1,78 @@
+// Copyright 2019 Google LLC
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include "ynnpack/kernels/unary/reference.h"
+
+#include <memory>
+
+#include "ynnpack/include/ynnpack.h"
+#include "ynnpack/kernels/unary/unary.h"
+
+namespace ynn {
+
+std::unique_ptr<unary_op_info> get_unary_op_info(ynn_unary_operator op,
+                                                 const unary_params& params) {
+  switch (op) {
+    case ynn_unary_abs:
+      return std::make_unique<abs>(params);
+    case ynn_unary_round:
+      return std::make_unique<round>(params);
+    case ynn_unary_ceil:
+      return std::make_unique<ceil>(params);
+    case ynn_unary_convert:
+      return std::make_unique<convert>(params);
+    case ynn_unary_requantize_to_uint8:
+      return std::make_unique<requantize_to_uint8>(params);
+    case ynn_unary_exp:
+      return std::make_unique<exp>(params);
+    case ynn_unary_expm1:
+      return std::make_unique<expm1>(params);
+    case ynn_unary_erf:
+      return std::make_unique<erf>(params);
+    case ynn_unary_approx_erf:
+      return std::make_unique<approx_erf>(params);
+    case ynn_unary_approx_tanh:
+      return std::make_unique<approx_tanh>(params);
+    case ynn_unary_floor:
+      return std::make_unique<floor>(params);
+    case ynn_unary_log:
+      return std::make_unique<log>(params);
+    case ynn_unary_log1p:
+      return std::make_unique<log1p>(params);
+    case ynn_unary_negate:
+      return std::make_unique<negate>(params);
+    case ynn_unary_rsqrt:
+      return std::make_unique<rsqrt>(params);
+    case ynn_unary_square:
+      return std::make_unique<square>(params);
+    case ynn_unary_sqrt:
+      return std::make_unique<sqrt>(params);
+    case ynn_unary_tanh:
+      return std::make_unique<tanh>(params);
+    case ynn_unary_cbrt:
+      return std::make_unique<cbrt>(params);
+    case ynn_unary_sign:
+      return std::make_unique<sign>(params);
+    case ynn_unary_sin:
+      return std::make_unique<sin>(params);
+    case ynn_unary_cos:
+      return std::make_unique<cos>(params);
+    case ynn_unary_sigmoid:
+      return std::make_unique<sigmoid>(params);
+    case ynn_unary_hardswish:
+      return std::make_unique<hardswish>(params);
+    case ynn_unary_poly3:
+      return std::make_unique<poly3>(params);
+    case ynn_unary_round_to_bf16:
+      return std::make_unique<round_to_bf16>(params);
+    case ynn_unary_tan:
+      return std::make_unique<tan>(params);
+    case ynn_unary_invalid:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+}  // namespace ynn
