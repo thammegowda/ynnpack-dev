@@ -147,19 +147,7 @@ IF(NOT TARGET slinky_base)
   IF(YNNPACK_USE_SYSTEM_LIBS)
     FIND_PACKAGE(slinky REQUIRED)
   ELSE()
-    SET(SLINKY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
-    IF(NOT DEFINED SLINKY_SOURCE_DIR)
-      MESSAGE(STATUS "Downloading slinky to ${CMAKE_BINARY_DIR}/slinky-source (define SLINKY_SOURCE_DIR to avoid it)")
-      CONFIGURE_FILE(cmake/DownloadSlinky.cmake "${CMAKE_BINARY_DIR}/slinky-download/CMakeLists.txt")
-      EXECUTE_PROCESS(COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}" .
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/slinky-download")
-      EXECUTE_PROCESS(COMMAND "${CMAKE_COMMAND}" --build .
-        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/slinky-download")
-      SET(SLINKY_SOURCE_DIR "${CMAKE_BINARY_DIR}/slinky-source" CACHE STRING "slinky source directory")
-    ENDIF()
-    # Temporarily disable testing while adding slinky to avoid including its tests.
-    INCLUDE_DIRECTORIES("${SLINKY_SOURCE_DIR}")
-    ADD_SUBDIRECTORY("${SLINKY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/slinky")
+    MESSAGE(FATAL_ERROR "Slinky is missing; add YNNPACK through the ynnpack-dev project root")
   ENDIF()
 ENDIF()
 

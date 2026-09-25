@@ -111,7 +111,7 @@ IF(YNNPACK_BUILD_BENCHMARKS)
   )
 
   ADD_EXECUTABLE(ynnpack_subgraph_dot_bench dot_bench.cc)
-  TARGET_LINK_LIBRARIES(ynnpack_subgraph_dot_bench ynnpack ynnpack_base ynnpack_subgraph_test_scheduler benchmark::benchmark)
+  TARGET_LINK_LIBRARIES(ynnpack_subgraph_dot_bench ynnpack ynnpack_base ynnpack_subgraph_test_scheduler benchmark::benchmark gtest)
 
   ADD_EXECUTABLE(ynnpack_subgraph_pi_bench pi_bench.cc)
   TARGET_LINK_LIBRARIES(ynnpack_subgraph_pi_bench ynnpack ynnpack_base ynnpack_subgraph ynnpack_subgraph_test_scheduler benchmark::benchmark_main)

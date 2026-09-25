@@ -10,8 +10,14 @@ notices are retained. See the
 [XNNPACK contributors](https://github.com/google/XNNPACK/graphs/contributors) for
 the upstream contributor history.
 
-## Slinky
+## Bundled dependencies
 
-YNNPACK depends on [Slinky](https://github.com/dsharlet/slinky), which is not
-included in this repository. Slinky is distributed under the MIT License;
-distributions that include it must retain its license and notices.
+The following projects are included as pinned Git submodules and retain their
+upstream licenses and copyright notices:
+
+- [Slinky](https://github.com/dsharlet/slinky), MIT License
+- [cpuinfo](https://github.com/pytorch/cpuinfo), BSD 2-Clause License
+- [GoogleTest](https://github.com/google/googletest), BSD 3-Clause License
+- [Google Benchmark](https://github.com/google/benchmark), Apache License 2.0
+
+License texts are available in each dependency's directory under `third_party/`.

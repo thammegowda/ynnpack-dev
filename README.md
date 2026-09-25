@@ -21,10 +21,24 @@ Existing source-file copyright notices are retained.
 
 ## Dependencies
 
-YNNPACK uses [Slinky](https://github.com/dsharlet/slinky) for loop lowering,
-scheduling, and execution. An embedding build may define the Slinky CMake targets
-before adding this directory. A standalone build can provide `SLINKY_SOURCE_DIR`,
-or allow YNNPACK's pinned Slinky download.
+Initialize the pinned dependencies after cloning:
+
+```sh
+git submodule update --init --recursive
+```
+
+| Dependency | Purpose | License |
+| --- | --- | --- |
+| [Slinky](https://github.com/dsharlet/slinky) | Loop lowering, scheduling, and execution | [MIT](third_party/slinky/LICENSE) |
+| [cpuinfo](https://github.com/pytorch/cpuinfo) | Runtime CPU feature detection | [BSD 2-Clause](third_party/cpuinfo/LICENSE) |
+| [GoogleTest](https://github.com/google/googletest) | Unit tests | [BSD 3-Clause](third_party/googletest/LICENSE) |
+| [Google Benchmark](https://github.com/google/benchmark) | Microbenchmarks | [Apache 2.0](third_party/benchmark/LICENSE) |
+
+Slinky and cpuinfo support the default library build. GoogleTest and Google
+Benchmark are added only when their corresponding build options are enabled.
+An embedding project may provide compatible `slinky_base` or `cpuinfo` targets
+before adding this project; `YNNPACK_USE_SYSTEM_LIBS=ON` selects an installed
+Slinky package.
 
 Python 3.10 or newer is required at build time to generate architecture-specific
 kernels. The generators use only the Python standard library.
@@ -32,13 +46,23 @@ kernels. The generators use only the Python standard library.
 ## Build
 
 ```sh
-cmake -S . -B build -DSLINKY_SOURCE_DIR=/path/to/slinky
+cmake -S . -B build
 cmake --build build
 ```
+
+To build and run the standalone test suite:
+
+```sh
+cmake -S . -B build-test -DYNNPACK_BUILD_TESTS=ON
+cmake --build build-test
+ctest --test-dir build-test --output-on-failure
+```
+
+Add `-DYNNPACK_BUILD_BENCHMARKS=ON` to build the microbenchmarks.
 
 ## License
 
 The extracted YNNPACK code remains under the BSD-style [LICENSE](LICENSE), which
 credits Facebook, Inc. and its affiliates and Google LLC. Retain the copyright
 notices, license conditions, and disclaimer when redistributing source or binaries.
-Slinky is separately licensed under the MIT License.
+Bundled dependencies retain their own licenses under `third_party/`.
