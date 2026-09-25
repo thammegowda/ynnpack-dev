@@ -129,19 +129,19 @@ MIN_MAX_KN_KERNEL(max_kn_uint8_neon, dummy_t, u8x16, uint8_t, 16);
 MIN_MAX_K1_KERNEL(max_k1_int8_neon, dummy_t, s8x16, int8_t, 16);
 MIN_MAX_KN_KERNEL(max_kn_int8_neon, dummy_t, s8x16, int8_t, 16);
 
-SUM_FLOAT_K1_KERNEL(sum_k1_bf16_fp32_neon, bfloat16, float, 4, 2, identity);
+SUM_FLOAT_K1_KERNEL(sum_k1_bf16_fp32_neon, bfloat16, float, 0, 1, identity);
 SUM_FLOAT_KN_KERNEL(sum_kn_bf16_fp32_neon, bfloat16, float, 8, identity);
-SUM_FLOAT_K1_KERNEL(sum_k1_fp32_neon, float, float, 4, 1, identity);
+SUM_FLOAT_K1_KERNEL(sum_k1_fp32_neon, float, float, 0, 1, identity);
 SUM_FLOAT_KN_KERNEL(sum_kn_fp32_neon, float, float, 4, identity);
 SUM_K1_KERNEL(sum_k1_int32_neon, int32_t, int32_t, 4, 1, identity);
 SUM_KN_KERNEL(sum_kn_int32_neon, int32_t, int32_t, 4, identity);
 SUM_KN_KERNEL(sum_kn_uint8_int32_neon, uint8_t, int32_t, 16, identity);
 SUM_KN_KERNEL(sum_kn_int8_int32_neon, int8_t, int32_t, 16, identity);
 
-SUM_FLOAT_K1_KERNEL(sum_squared_k1_bf16_fp32_neon, bfloat16, float, 4, 2,
+SUM_FLOAT_K1_KERNEL(sum_squared_k1_bf16_fp32_neon, bfloat16, float, 0, 1,
                     square);
 SUM_FLOAT_KN_KERNEL(sum_squared_kn_bf16_fp32_neon, bfloat16, float, 8, square);
-SUM_FLOAT_K1_KERNEL(sum_squared_k1_fp32_neon, float, float, 4, 1, square);
+SUM_FLOAT_K1_KERNEL(sum_squared_k1_fp32_neon, float, float, 0, 1, square);
 SUM_FLOAT_KN_KERNEL(sum_squared_kn_fp32_neon, float, float, 4, square);
 SUM_KN_KERNEL(sum_squared_kn_uint8_int32_neon, uint8_t, int32_t, 16, square);
 SUM_KN_KERNEL(sum_squared_kn_int8_int32_neon, int8_t, int32_t, 16, square);
