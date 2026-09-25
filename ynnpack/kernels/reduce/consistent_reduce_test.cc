@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include "ynnpack/base/arch.h"
@@ -130,6 +131,40 @@ void TestReduce(AT, CT, ynn_reduce_operator op, size_t n, size_t k, int k_dim) {
     } else {
       c = kernel_c;
       reference_kernel_name = kernel.name;
+    }
+  }
+}
+
+TEST(Reduce, Bfloat16Rounding) {
+  for (const KernelInfo& kernel : all_kernels) {
+    if (kernel.type != multi_type_of(bfloat16{}, float{}) ||
+        (kernel.op != ynn_reduce_sum && kernel.op != ynn_reduce_sum_squared) ||
+        !is_arch_supported(kernel.arch_flags)) {
+      continue;
+    }
+    SCOPED_TRACE(kernel.name);
+    const size_t batches = 3;
+    const size_t elements = 65;
+    const bool contiguous = kernel.k_dim == reduce_dim::k1;
+    Tensor<bfloat16> input(contiguous ? std::vector<size_t>{batches, elements}
+                                      : std::vector<size_t>{elements, batches});
+    input.fill(bfloat16(0.0f));
+    Tensor<float> output({batches});
+    output.fill(0.0f);
+    const bfloat16 increment(kernel.op == ynn_reduce_sum ? 0x1p-24f : 0x1p-12f);
+    for (size_t batch = 0; batch < batches; ++batch) {
+      if (contiguous) {
+        input(batch, 0) = bfloat16(1.0f);
+        input(batch, 16) = increment;
+      } else {
+        input(0, batch) = bfloat16(1.0f);
+        input(1, batch) = increment;
+      }
+    }
+    kernel.kernel(batches, elements, input.stride_bytes(0), input.base(),
+                  output.base(), nullptr);
+    for (size_t batch = 0; batch < batches; ++batch) {
+      EXPECT_EQ(output[batch], 1.0f);
     }
   }
 }

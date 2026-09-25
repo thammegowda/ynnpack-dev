@@ -47,11 +47,11 @@ using simd::f32x4;
 using simd::f32x8;
 using simd::f32x8;
 
-SUM_FLOAT_K1_KERNEL(sum_squared_k1_bf16_fp32_neonfma, bfloat16, float, 8, 1,
+SUM_FLOAT_K1_KERNEL(sum_squared_k1_bf16_fp32_neonfma, bfloat16, float, 0, 1,
                     square);
 SUM_FLOAT_KN_KERNEL(sum_squared_kn_bf16_fp32_neonfma, bfloat16, float, 8,
                     square);
-SUM_FLOAT_K1_KERNEL(sum_squared_k1_fp32_neonfma, float, float, 4, 1, square);
+SUM_FLOAT_K1_KERNEL(sum_squared_k1_fp32_neonfma, float, float, 0, 1, square);
 SUM_FLOAT_KN_KERNEL(sum_squared_kn_fp32_neonfma, float, float, 4, square);
 
 }  // namespace ynn

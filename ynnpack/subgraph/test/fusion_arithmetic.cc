@@ -465,9 +465,14 @@ TEST(fusion, dequantize_dot) {
   subgraph.fusion();
   subgraph.invalidate_dead_values();
 
-  ASSERT_THAT(subgraph, AllOf(HasValidNodeCount(3), HasValidValueCount(10)));
-  EXPECT_THAT(ProducerOf(x_id, subgraph),
-              AllOf(IsDequantizeDot(), HasInputCount(6)));
+  EXPECT_THAT(
+      ProducerOf(x_id, subgraph),
+      AllOf(IsDequantizeDot(), InputsAre(dot_output_id, a_offset_id,
+                                         b_offset_id, c_id, d_id, zero_id)));
+  EXPECT_THAT(ProducerOf(dot_output_id, subgraph), IsDot());
+  EXPECT_THAT(ProducerOf(dot_output_id, subgraph).inputs,
+              ElementsAre(testing::_, testing::_, YNN_INVALID_VALUE_ID));
+  EXPECT_FALSE(subgraph.value(sm_id).is_valid());
 }
 
 TEST(fusion, dequantize_dot_add) {
@@ -955,8 +960,8 @@ TEST(fusion, fast_math_tanh_folded) {
 }
 
 TEST(fusion, dynamic_quantize_to_uint8) {
-  int rewrite_count = 0;
   for (ynn_type rhs_type : {ynn_type_int8, ynn_type_int4, ynn_type_int2}) {
+    SCOPED_TRACE(rhs_type);
     const uint32_t input_id = 0;
     const uint32_t rhs_id = 1;
     const uint32_t output_id = 2;
@@ -993,9 +998,6 @@ TEST(fusion, dynamic_quantize_to_uint8) {
     builder.AddDot(1, quantized_id, rhs_id, YNN_INVALID_VALUE_ID, output_id);
 
     bool expect_rewrite = prefer_uint8_dot(rhs_type);
-    if (expect_rewrite) {
-      rewrite_count++;
-    }
 
     subgraph.fusion();
     subgraph.invalidate_dead_values();
@@ -1010,14 +1012,16 @@ TEST(fusion, dynamic_quantize_to_uint8) {
       EXPECT_EQ(dq_op->output_zero_point, 128);
     } else {
       EXPECT_EQ(subgraph.value(quantized_id).type, ynn_type_int8);
+      EXPECT_THAT(ProducerOf(zp_id, subgraph), IsDynamicQuantization(0));
+      EXPECT_THAT(subgraph.value(ProducerOf(output_id, subgraph).inputs[0]),
+                  HasType(ynn_type_int8));
     }
   }
-  EXPECT_GT(rewrite_count, 0);
 }
 
 TEST(fusion, dynamic_quantize_to_uint8_with_pad) {
-  int rewrite_count = 0;
   for (ynn_type rhs_type : {ynn_type_int8, ynn_type_int4, ynn_type_int2}) {
+    SCOPED_TRACE(rhs_type);
     const uint32_t input_id = 0;
     const uint32_t rhs_id = 1;
     const uint32_t output_id = 2;
@@ -1062,9 +1066,6 @@ TEST(fusion, dynamic_quantize_to_uint8_with_pad) {
                    output_id);
 
     bool expect_rewrite = prefer_uint8_dot(rhs_type);
-    if (expect_rewrite) {
-      rewrite_count++;
-    }
 
     subgraph.fusion();
     subgraph.invalidate_dead_values();
@@ -1081,9 +1082,11 @@ TEST(fusion, dynamic_quantize_to_uint8_with_pad) {
     } else {
       EXPECT_THAT(subgraph.value(quantized_id), HasType(ynn_type_int8));
       EXPECT_THAT(subgraph.value(padded_quantized_id), HasType(ynn_type_int8));
+      EXPECT_THAT(ProducerOf(zp_id, subgraph), IsDynamicQuantization(0));
+      EXPECT_THAT(subgraph.value(ProducerOf(output_id, subgraph).inputs[0]),
+                  HasType(ynn_type_int8));
     }
   }
-  EXPECT_GT(rewrite_count, 0);
 }
 
 TEST(fusion, requantize_quantize) {

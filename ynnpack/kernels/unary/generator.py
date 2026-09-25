@@ -342,6 +342,7 @@ def main(argv: Sequence[str]) -> None:
           (log_fp32, (16, 1)),
           (negate_fp32, (8, 1), consistent),
           (poly3_fp32, (32, 1)),
+          (requantize_to_uint8, (16, 1), consistent),
           (round_fp32, (8, 1), consistent),
           (round_to_bf16_fp32, (16, 1), consistent),
           (rsqrt_fp32, (8, 1)),
