@@ -60,6 +60,32 @@ ctest --test-dir build-test --output-on-failure
 
 Add `-DYNNPACK_BUILD_BENCHMARKS=ON` to build the microbenchmarks.
 
+## Embed with CMake
+
+After initializing this repository's submodules, an application needs only:
+
+```cmake
+add_subdirectory(third_party/ynnpack-dev EXCLUDE_FROM_ALL)
+target_link_libraries(my_app PRIVATE ynnpack ynnpack_composites)
+```
+
+`ynnpack` exports the public and source-root include paths. Link
+`ynnpack_composites` as well when using its higher-level graph builders.
+Python discovery, Slinky, and CPU feature detection are managed by the library;
+no custom cpuinfo target or private include path is needed on Apple Silicon.
+
+Tests and benchmarks default to OFF. Native builds default to bundled cpuinfo;
+Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 SME and
+SME2 default to ON only when compile checks accept the required flags, header,
+intrinsics, and streaming attributes. These checks do not execute target code,
+so they also work while cross-compiling. Runtime dispatch still depends on CPU
+feature detection.
+
+The `YNN_ENABLE_CPUINFO`, `YNN_ENABLE_ARM64_SME`, and `YNN_ENABLE_ARM64_SME2`
+options remain available for explicit overrides. When migrating an existing
+build that forced these options, clear those cached values or use a fresh build
+directory to pick up the new defaults.
+
 ## License
 
 The extracted YNNPACK code remains under the BSD-style [LICENSE](LICENSE), which

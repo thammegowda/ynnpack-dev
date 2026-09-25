@@ -2,10 +2,20 @@ cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
 
 project(ynnpack_dev LANGUAGES C CXX)
 
+if(NOT DEFINED Python3_FIND_VIRTUALENV)
+	set(Python3_FIND_VIRTUALENV STANDARD)
+endif()
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+
 option(YNNPACK_BUILD_TESTS "Build YNNPACK unit tests" OFF)
 option(YNNPACK_BUILD_BENCHMARKS "Build YNNPACK benchmarks" OFF)
 option(YNNPACK_USE_SYSTEM_LIBS "Use installed dependencies where supported" OFF)
-option(YNN_ENABLE_CPUINFO "Enable cpuinfo" ON)
+if(EMSCRIPTEN OR YNNPACK_TARGET_PROCESSOR STREQUAL "wasm")
+	set(YNN_CPUINFO_DEFAULT OFF)
+else()
+	set(YNN_CPUINFO_DEFAULT ON)
+endif()
+option(YNN_ENABLE_CPUINFO "Enable cpuinfo" ${YNN_CPUINFO_DEFAULT})
 
 if(YNNPACK_BUILD_TESTS)
 	enable_testing()
