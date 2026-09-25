@@ -130,13 +130,16 @@ void TestUnary(AT, XT, ynn_unary_operator op, size_t n) {
 
     if (reference_x.base()) {
       for (size_t i = 0; i < n; ++i) {
-        if (isnan(reference_x[i])) {
-          ASSERT_TRUE(isnan(kernel_x[i]))
+        using X = typename type_info<XT>::element_type;
+        const X reference_value = reference_x[i];
+        const X kernel_value = kernel_x[i];
+        if (isnan(reference_value)) {
+          ASSERT_TRUE(isnan(kernel_value))
               << "kernel `" << kernel.name
               << "` is inconsistent with reference kernel `"
               << reference_kernel_name << "`";
         } else {
-          ASSERT_EQ(reference_x[i], kernel_x[i])
+          ASSERT_EQ(reference_value, kernel_value)
               << "a[i]=" << a[i] << ", kernel `" << kernel.name
               << "` is inconsistent with reference kernel `"
               << reference_kernel_name << "`";
