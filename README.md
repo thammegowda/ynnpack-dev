@@ -75,14 +75,15 @@ Python discovery, Slinky, and CPU feature detection are managed by the library;
 no custom cpuinfo target or private include path is needed on Apple Silicon.
 
 Tests and benchmarks default to OFF. Native builds default to bundled cpuinfo;
-Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 SME and
-SME2 default to ON only when compile checks accept the required flags, header,
-intrinsics, and streaming attributes. These checks do not execute target code,
-so they also work while cross-compiling. Runtime dispatch still depends on CPU
-feature detection.
+Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 FP8,
+FP8DOT4, SME, and SME2 default to ON only when compile checks accept the required
+flags, headers, intrinsic types, and attributes. SVE additionally defaults to
+OFF on Apple platforms; elsewhere its check also verifies SVE C++ type support.
+These checks do not execute target code, so they also work while cross-compiling.
+Runtime dispatch still depends on CPU feature detection.
 
-The `YNN_ENABLE_CPUINFO`, `YNN_ENABLE_ARM64_SME`, and `YNN_ENABLE_ARM64_SME2`
-options remain available for explicit overrides. When migrating an existing
+The `YNN_ENABLE_CPUINFO` and `YNN_ENABLE_ARM64_*` options remain available for
+explicit overrides. When migrating an existing
 build that forced these options, clear those cached values or use a fresh build
 directory to pick up the new defaults.
 

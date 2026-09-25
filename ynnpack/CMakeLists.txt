@@ -117,47 +117,85 @@ OPTION(YNN_ENABLE_ARM_NEONBF16 "Enable ARM NEONBF16" ${YNN_ENABLE_ARM_NEON})
 OPTION(YNN_ENABLE_ARM64 "Enable ARM64" ${YNN_ARM64_DEFAULT})
 OPTION(YNN_ENABLE_ARM64_NEONI8MM "Enable ARM64 NEONI8MM" ${YNN_ENABLE_ARM64})
 OPTION(YNN_ENABLE_ARM64_NEON "Enable ARM64 NEON" ${YNN_ENABLE_ARM64})
-OPTION(YNN_ENABLE_ARM64_NEONFP8 "Enable ARM64 NEONFP8" ${YNN_ENABLE_ARM64_NEON})
-OPTION(YNN_ENABLE_ARM64_NEONFP8DOT4 "Enable ARM64 NEONFP8DOT4" ${YNN_ENABLE_ARM64_NEONFP8})
 
+SET(YNN_ARM64_FP8_DEFAULT OFF)
+SET(YNN_ARM64_FP8DOT4_DEFAULT OFF)
 SET(YNN_ARM64_SME_DEFAULT OFF)
 SET(YNN_ARM64_SME2_DEFAULT OFF)
+SET(YNN_ARM64_SVE_DEFAULT OFF)
 IF(YNN_ENABLE_ARM64)
   INCLUDE(CheckCXXSourceCompiles)
   INCLUDE(CMakePushCheckState)
   INCLUDE(kernels/arch_copts.cmake)
-  FUNCTION(YNN_CHECK_SME_COMPILER ARCH FEATURE RESULT)
+  FUNCTION(YNN_CHECK_ARM64_COMPILER ARCH SOURCE RESULT)
     CMAKE_PUSH_CHECK_STATE(RESET)
     SET(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
     YNN_GET_ARCH_COPTS(${ARCH} FLAGS)
     STRING(JOIN " " CMAKE_REQUIRED_FLAGS ${FLAGS})
-    CHECK_CXX_SOURCE_COMPILES("
+    CHECK_CXX_SOURCE_COMPILES("${SOURCE}" ${RESULT})
+    CMAKE_POP_CHECK_STATE()
+  ENDFUNCTION()
+  FUNCTION(YNN_CHECK_SME_COMPILER ARCH FEATURE RESULT)
+    YNN_CHECK_ARM64_COMPILER(${ARCH} "
       #include <arm_sme.h>
       #if !defined(${FEATURE}) || (defined(__APPLE__) && defined(__clang__) && __clang_major__ < 17)
       #error Unsupported SME compiler
       #endif
       __arm_new(\"za\") __arm_locally_streaming void check_sme() { svzero_za(); }
     " ${RESULT})
-    CMAKE_POP_CHECK_STATE()
   ENDFUNCTION()
+  IF(YNN_ENABLE_ARM64_NEON)
+    YNN_CHECK_ARM64_COMPILER(arm64_neonfp8 "
+      #include <arm_neon.h>
+      #include <arm_acle.h>
+      mfloat8x16_t check_fp8(uint8x16_t bytes) {
+        fpm_t mode = __arm_fpm_init();
+        mode = __arm_set_fpm_src1_format(mode, __ARM_FPM_E5M2);
+        mode = __arm_set_fpm_src2_format(mode, __ARM_FPM_E4M3);
+        return vreinterpretq_mf8_u8(bytes);
+      }
+    " YNN_COMPILER_HAS_FP8)
+    SET(YNN_ARM64_FP8_DEFAULT ${YNN_COMPILER_HAS_FP8})
+    IF(YNN_COMPILER_HAS_FP8)
+      YNN_CHECK_ARM64_COMPILER(arm64_neonfp8dot4 "
+        #include <arm_neon.h>
+        #include <arm_acle.h>
+        float32x4_t check_fp8dot4(float32x4_t sum, uint8x16_t rhs, uint8x8_t lhs) {
+          fpm_t mode = __arm_fpm_init();
+          return vdotq_lane_f32_mf8_fpm(sum, vreinterpretq_mf8_u8(rhs),
+                                       vreinterpret_mf8_u8(lhs), 0, mode);
+        }
+      " YNN_COMPILER_HAS_FP8DOT4)
+      SET(YNN_ARM64_FP8DOT4_DEFAULT ${YNN_COMPILER_HAS_FP8DOT4})
+    ENDIF()
+  ENDIF()
   YNN_CHECK_SME_COMPILER(arm64_sme __ARM_FEATURE_SME YNN_COMPILER_HAS_SME)
   YNN_CHECK_SME_COMPILER(arm64_sme2 __ARM_FEATURE_SME2 YNN_COMPILER_HAS_SME2)
   SET(YNN_ARM64_SME_DEFAULT ${YNN_COMPILER_HAS_SME})
   IF(YNN_COMPILER_HAS_SME)
     SET(YNN_ARM64_SME2_DEFAULT ${YNN_COMPILER_HAS_SME2})
   ENDIF()
+  IF(NOT APPLE)
+    YNN_CHECK_ARM64_COMPILER(arm64_sve "
+      #include <arm_sve.h>
+      #include <arm_neon_sve_bridge.h>
+      svbool_t check_sve(svbool_t predicate) { return predicate; }
+      float32x4_t check_sve_bridge(svfloat32_t value) { return svget_neonq_f32(value); }
+    " YNN_COMPILER_HAS_SVE)
+    SET(YNN_ARM64_SVE_DEFAULT ${YNN_COMPILER_HAS_SVE})
+  ENDIF()
 ENDIF()
+OPTION(YNN_ENABLE_ARM64_NEONFP8 "Enable ARM64 NEONFP8" ${YNN_ARM64_FP8_DEFAULT})
+IF(NOT YNN_ENABLE_ARM64_NEONFP8)
+  SET(YNN_ARM64_FP8DOT4_DEFAULT OFF)
+ENDIF()
+OPTION(YNN_ENABLE_ARM64_NEONFP8DOT4 "Enable ARM64 NEONFP8DOT4" ${YNN_ARM64_FP8DOT4_DEFAULT})
 OPTION(YNN_ENABLE_ARM64_SME "Enable ARM64 SME" ${YNN_ARM64_SME_DEFAULT})
 IF(NOT YNN_ENABLE_ARM64_SME)
   SET(YNN_ARM64_SME2_DEFAULT OFF)
 ENDIF()
 OPTION(YNN_ENABLE_ARM64_SME2 "Enable ARM64 SME2" ${YNN_ARM64_SME2_DEFAULT})
 
-IF(YNN_ENABLE_ARM64 AND NOT APPLE)
-  SET(YNN_ARM64_SVE_DEFAULT ON)
-ELSE()
-  SET(YNN_ARM64_SVE_DEFAULT OFF)
-ENDIF()
 OPTION(YNN_ENABLE_ARM64_SVE "Enable ARM64 SVE" ${YNN_ARM64_SVE_DEFAULT})
 
 # Others

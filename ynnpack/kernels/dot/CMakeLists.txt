@@ -123,6 +123,10 @@ YNN_ADD_DOT_KERNELS(x86_fp32_k4
   x86_avx512 x86_avx512_fp32_k4
 )
 
+YNN_ADD_DOT_KERNELS(x86_fp32_k8
+  x86_avx2_fma3 x86_avx2_fma3_fp32_k8
+)
+
 YNN_ADD_DOT_KERNELS(x86_fp64
   x86_avx x86_avx_fp64
   x86_fma3 x86_fma3_fp64
@@ -168,6 +172,18 @@ YNN_ADD_DOT_KERNELS(x86_uint8_int8_int32
 
 YNN_ADD_DOT_KERNELS(x86_uint8_int8_int32_k16
   x86_avx512vnni x86_avx512vnni_uint8_int8_int32_k16
+)
+
+YNN_ADD_DOT_KERNELS(x86_uint8_int2_int32
+  x86_avx2 x86_avx2_uint8_int2_int32
+  x86_avx512 x86_avx512_uint8_int2_int32
+  x86_avx512vnni x86_avx512vnni_uint8_int2_int32
+)
+
+YNN_ADD_DOT_KERNELS(x86_uint8_int4_int32
+  x86_avx2 x86_avx2_uint8_int4_int32
+  x86_avx512 x86_avx512_uint8_int4_int32
+  x86_avx512vnni x86_avx512vnni_uint8_int4_int32
 )
 
 YNN_ADD_DOT_SRC(x86_amxbf16 x86_amxbf16.cc)
