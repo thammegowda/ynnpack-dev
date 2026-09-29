@@ -110,8 +110,8 @@ YNN_INTRINSIC int32_t unaligned_load_int8x4(const void* ptr) {
 }
 
 YNN_INTRINSIC __m512i _mm512_hadd_epi32(__m512i a, __m512i b) {
-    a = _mm512_add_epi32(a, _mm512_shuffle_epi32(a, _MM_SHUFFLE(2, 3, 0, 1)));
-    b = _mm512_add_epi32(b, _mm512_shuffle_epi32(b, _MM_SHUFFLE(2, 3, 0, 1)));
+  a = _mm512_add_epi32(a, _mm512_shuffle_epi32(a, _MM_PERM_CDAB));
+  b = _mm512_add_epi32(b, _mm512_shuffle_epi32(b, _MM_PERM_CDAB));
     return _mm512_permutex2var_epi32(a,
         _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30),
         b
