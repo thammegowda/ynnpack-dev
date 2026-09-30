@@ -1101,6 +1101,13 @@ ynn_runtime::ynn_runtime(ynn::ref_count<const ynn_subgraph> subgraph,
       value.buffer =
           slinky::buffer_expr::make_constant(value.symbol, value.data);
     } else if (value.is_external()) {
+      if (value.data) {
+        auto data = slinky::raw_buffer::make(value.data->rank, value.data->elem_size);
+        data->base = value.data->base;
+        for (size_t axis = 0; axis < value.data->rank; ++axis)
+          data->mutable_dim(axis) = value.data->dim(axis);
+        value.data = std::move(data);
+      }
       value.make_buffer(*this);
 
       for (size_t d = 0; d < value.extents.size(); ++d) {
@@ -1272,8 +1279,6 @@ ynn_status ynn_runtime::invoke() {
     return ynn_status_success;
   }
   slinky::index_t result = pipeline.evaluate(eval_context, /*is_set_up=*/true);
-  // Heap blocks are reused within an evaluation, but not kept between invokes.
-  eval_context.free_pool();
   return result ? ynn_status_error : ynn_status_success;
 }
 
