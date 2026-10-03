@@ -154,7 +154,8 @@ void require_contiguous(slinky::buffer_expr& buf, size_t dims) {
 
 slinky::interval_expr elementwise_bounds(slinky::var dim,
                                          const slinky::expr& extent) {
-  return extent.defined() ? slinky::point(dim) : slinky::point(0);
+  return extent.defined() && !slinky::is_constant(extent, 1)
+             ? slinky::point(dim) : slinky::point(0);
 }
 
 slinky::interval_expr all_bounds(const slinky::expr& extent) {

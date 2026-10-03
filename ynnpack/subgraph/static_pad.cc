@@ -3,6 +3,7 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -103,9 +104,32 @@ ynn_status ynn_define_static_pad(ynn_subgraph_t subgraph, size_t num_axes,
         padding.bounds[p.axis] = slinky::point(dims[p.axis]) - p.pre_padding;
       }
 
-      f = slinky::func::make_copy(std::move(func_input),
-                                  {output.buffer, std::move(dims)},
-                                  std::move(padding));
+      const bool bounded_singleton = std::any_of(op.paddings.begin(), op.paddings.end(),
+          [&](const auto& item) { return slinky::is_constant(input.extent(item.axis), 1); });
+      if (bounded_singleton) {
+        for (const auto& item : op.paddings) {
+          if (slinky::is_constant(input.extent(item.axis), 1))
+            func_input.bounds[item.axis] = slinky::point(0);
+        }
+        auto copy = [paddings = op.paddings](
+            slinky::buffer<const void, YNN_MAX_TENSOR_RANK> source,
+            const slinky::raw_buffer& fill,
+            const slinky::raw_buffer& destination) -> slinky::index_t {
+          for (const auto& item : paddings) {
+            auto& dimension = source.mutable_dim(item.axis);
+            if (dimension.is_broadcast()) dimension = slinky::dim(0, 0, source.elem_size);
+            dimension.translate(item.pre_padding);
+          }
+          slinky::copy(source, destination, fill);
+          return 0;
+        };
+        f = slinky::func::make(std::move(copy), {std::move(func_input), std::move(padding)},
+                               {{output.buffer, std::move(dims)}});
+      } else {
+        f = slinky::func::make_copy(std::move(func_input),
+                                    {output.buffer, std::move(dims)},
+                                    std::move(padding));
+      }
     } else {
       f = slinky::func::make_copy(std::move(func_input),
                                   {output.buffer, std::move(dims)});

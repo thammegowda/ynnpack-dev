@@ -4,9 +4,12 @@
 # LICENSE file in the root directory of this source tree.
 
 ADD_LIBRARY(ynnpack_composites STATIC
+  attention_prefill.cc
+  flash_attention.cc
   dot.cc
   dot_quantization.cc
   elementwise.cc
+  feed_forward.cc
   normalization.cc
   pooling.cc
   reduction.cc
@@ -15,4 +18,6 @@ ADD_LIBRARY(ynnpack_composites STATIC
 TARGET_INCLUDE_DIRECTORIES(ynnpack_composites PUBLIC .)
 TARGET_LINK_LIBRARIES(ynnpack_composites PUBLIC
   ynnpack_base
+  ynnpack_kernels_reduce
+  ynnpack_kernels_unary
 )

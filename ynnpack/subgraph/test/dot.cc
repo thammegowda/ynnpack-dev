@@ -31,6 +31,26 @@
 
 namespace ynn {
 
+TEST(Dot, singleton_batch_broadcast) {
+  SubgraphBuilder builder(3);
+  builder.AddInput(ynn_type_fp32, {2, 1, 3, 5}, 0)
+    .AddInput(ynn_type_fp32, {4, 5, 7}, 1)
+    .AddOutput(ynn_type_fp32, 4, 2)
+    .AddDot(1, 0, 1, YNN_INVALID_VALUE_ID, 2);
+  Runtime runtime(builder.GetSubgraph());
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+  std::vector<float> left(2 * 3 * 5), right(4 * 5 * 7), output(2 * 4 * 3 * 7);
+  for (size_t index = 0; index < left.size(); ++index) left[index] = float(index / 15 + 1);
+  for (size_t index = 0; index < right.size(); ++index) right[index] = float(index / 35 + 1);
+  runtime.ReshapeExternalTensor({2, 1, 3, 5}, left.data(), 0)
+    .ReshapeExternalTensor({4, 5, 7}, right.data(), 1)
+    .SetupExternalTensor(output.data(), 2).ReshapeRuntime().InvokeRuntime();
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+  EXPECT_EQ(runtime.GetExternalTensorShape(2), std::vector<size_t>({2, 4, 3, 7}));
+  for (size_t index = 0; index < output.size(); ++index)
+  EXPECT_EQ(output[index], float(5 * (index / 84 + 1) * (index / 21 % 4 + 1)));
+}
+
 constexpr int max_k_dims = 3;
 
 std::uniform_int_distribution<size_t> rank_dist(2, max_k_dims + 2);
