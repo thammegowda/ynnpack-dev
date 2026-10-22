@@ -1,7 +1,7 @@
 # ynnpack-dev
 
 ynnpack-dev is a standalone development fork of
-[YNNPACK](https://github.com/google/XNNPACK/tree/4691de78a2ed13e74a07108b0a4d033efa00ad4a/ynnpack).
+[YNNPACK](https://github.com/google/XNNPACK/tree/78d255d4d6455f0249cfdd229756ee90e476e317/ynnpack).
 It retains YNNPACK's graph compiler, Slinky lowering, composites, tests, benchmarks,
 and generated CPU kernels while omitting the XNNPACK compatibility layer and
 Bazel-only metadata. Its API may evolve independently, including adding selected
@@ -18,6 +18,33 @@ on 2026-09-24. That YNNPACK tree is identical to the tree at upstream commit
 Credit for the original design and implementation belongs to the
 [XNNPACK and YNNPACK contributors](https://github.com/google/XNNPACK/graphs/contributors).
 Existing source-file copyright notices are retained.
+
+## Upstream review
+
+Last reviewed upstream commit (2026-10-22):
+[`78d255d4d6455f0249cfdd229756ee90e476e317`](https://github.com/google/XNNPACK/commit/78d255d4d6455f0249cfdd229756ee90e476e317).
+This is a review watermark, not a claim that every upstream change is integrated.
+The extraction commit above remains the historical origin.
+
+[Changes since the last review](https://github.com/google/XNNPACK/compare/78d255d4d6455f0249cfdd229756ee90e476e317...master)
+and [the porting ledger](UPSTREAM.md) are the starting points for the next review.
+The latest YNNPACK change within this snapshot is
+[`533bf3f5`](https://github.com/google/XNNPACK/commit/533bf3f5afd2ad80016bfd05b81caa558dee729c).
+
+For a path-filtered review, clone upstream once, then fetch and list new changes:
+
+```sh
+git clone --filter=blob:none --no-checkout https://github.com/google/XNNPACK.git ../XNNPACK-upstream
+git -C ../XNNPACK-upstream fetch origin master
+git -C ../XNNPACK-upstream log --reverse --format='%h %cs %s' \
+	78d255d4d6455f0249cfdd229756ee90e476e317..origin/master \
+	-- ynnpack cmake/DownloadCpuinfo.cmake
+```
+
+Review the existing backlog as well as the new delta. After reviewing a snapshot,
+record each relevant change's disposition in the ledger, then advance this
+watermark, compare link, source link, and log command together. Unported items
+stay in the ledger even when the watermark advances.
 
 ## Dependencies
 
@@ -58,6 +85,18 @@ cmake --build build-test
 ctest --test-dir build-test --output-on-failure
 ```
 
+Native builds register dot cases individually so CTest can run them in parallel
+without shortening their five-second fuzz budgets. To run just these cases with
+eight workers:
+
+```sh
+ctest --test-dir build-test --parallel 8 --output-on-failure -R '^ynnpack_subgraph_dot_test'
+```
+
+Cross-compiled builds retain a single dot test entry to avoid executing target
+binaries during test discovery. CI already selects parallelism from the runner's
+CPU count.
+
 Add `-DYNNPACK_BUILD_BENCHMARKS=ON` to build the microbenchmarks.
 
 ## Embed with CMake
@@ -79,6 +118,8 @@ Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 FP8,
 FP8DOT4, SME, and SME2 default to ON only when compile checks accept the required
 flags, headers, intrinsic types, and attributes. SVE additionally defaults to
 OFF on Apple platforms; elsewhere its check also verifies SVE C++ type support.
+SME and SME2 additionally default to OFF on Windows, where Clang's SME hazard
+padding code generation is unsupported even when the intrinsic probes pass.
 These checks do not execute target code, so they also work while cross-compiling.
 Runtime dispatch still depends on CPU feature detection.
 

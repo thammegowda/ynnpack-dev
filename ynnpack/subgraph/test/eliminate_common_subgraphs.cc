@@ -4,6 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <cstdint>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -237,6 +238,77 @@ TEST(eliminate_common_subgraphs, no_merge_different_inputs) {
   EXPECT_THAT(subgraph, AllOf(HasValidNodeCount(4),
                               HasValidValueIds(input1_id, input2_id, t1_id,
                                                t2_id, output1_id, output2_id)));
+}
+
+TEST(eliminate_common_subgraphs, unary_parameter_comparisons) {
+  for (ynn_unary_operator operation :
+       {ynn_unary_expm1, ynn_unary_log, ynn_unary_log1p, ynn_unary_sin,
+        ynn_unary_cos, ynn_unary_sqrt}) {
+    ynn_node::unary_elementwise first{operation, get_unary_params(operation)};
+    auto second = first;
+    EXPECT_TRUE(first == second);
+    EXPECT_FALSE(first < second);
+    EXPECT_FALSE(second < first);
+    switch (operation) {
+      case ynn_unary_expm1:
+        second.params.expm1.input_multiplier = 2.0;
+        break;
+      case ynn_unary_log:
+        second.params.log.input_multiplier = 2.0;
+        break;
+      case ynn_unary_log1p:
+        second.params.log1p.input_multiplier = 2.0;
+        break;
+      case ynn_unary_sin:
+        second.params.sin.output_multiplier = 2.0;
+        break;
+      case ynn_unary_cos:
+        second.params.cos.output_multiplier = 2.0;
+        break;
+      case ynn_unary_sqrt:
+        second.params.sqrt.input_offset = 0.5;
+        break;
+      default:
+        FAIL() << "Unexpected unary operation";
+    }
+    EXPECT_FALSE(first == second);
+    EXPECT_NE(first < second, second < first);
+  }
+}
+
+TEST(eliminate_common_subgraphs, no_merge_different_output_shapes) {
+  for (const std::vector<size_t>& second_shape :
+       {std::vector<size_t>{8}, std::vector<size_t>{4, 4}}) {
+    const uint32_t begin_id = 0;
+    const uint32_t stride_id = 1;
+    const uint32_t output1_id = 2;
+    const uint32_t output2_id = 3;
+    uint32_t temp1_id = YNN_INVALID_VALUE_ID;
+    uint32_t temp2_id = YNN_INVALID_VALUE_ID;
+
+    SubgraphBuilder builder(4);
+    builder.AddInput(type_of<int32_t>(), 0, begin_id)
+        .AddInput(type_of<int32_t>(), 0, stride_id)
+        .AddOutput(type_of<int32_t>(), 1, output1_id)
+        .AddOutput(type_of<int32_t>(), second_shape.size(), output2_id)
+        .AddTensor(type_of<int32_t>(), 1, temp1_id)
+        .AddTensor(type_of<int32_t>(), second_shape.size(), temp2_id);
+    builder.AddIota(type_of<int32_t>(), {4}, begin_id, stride_id, temp1_id);
+    builder.AddIota(type_of<int32_t>(), second_shape, begin_id, stride_id,
+                    temp2_id);
+    builder.AddCopy(temp1_id, output1_id);
+    builder.AddCopy(temp2_id, output2_id);
+
+    ynn_subgraph& subgraph = *builder.GetSubgraph();
+    ASSERT_THAT(subgraph, HasValidNodeCount(4));
+    ASSERT_EQ(subgraph.eliminate_common_subgraphs(), ynn_status_success);
+    subgraph.invalidate_dead_values();
+
+    EXPECT_THAT(subgraph,
+                AllOf(HasValidNodeCount(4),
+                      HasValidValueIds(begin_id, stride_id, temp1_id, temp2_id,
+                                       output1_id, output2_id)));
+  }
 }
 
 }  // namespace ynn
