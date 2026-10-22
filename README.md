@@ -106,6 +106,8 @@ Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 FP8,
 FP8DOT4, SME, and SME2 default to ON only when compile checks accept the required
 flags, headers, intrinsic types, and attributes. SVE additionally defaults to
 OFF on Apple platforms; elsewhere its check also verifies SVE C++ type support.
+SME and SME2 additionally default to OFF on Windows, where Clang's SME hazard
+padding code generation is unsupported even when the intrinsic probes pass.
 These checks do not execute target code, so they also work while cross-compiling.
 Runtime dispatch still depends on CPU feature detection.
 
