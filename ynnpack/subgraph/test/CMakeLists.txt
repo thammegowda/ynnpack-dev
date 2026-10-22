@@ -71,6 +71,8 @@ TARGET_LINK_LIBRARIES(ynnpack_subgraph_unary_test ynnpack_kernels_unary_referenc
 
 YNN_ADD_SUBGRAPH_TEST(dot)
 YNN_ADD_SUBGRAPH_TEST(gelu)
+YNN_ADD_SUBGRAPH_TEST(loop_fusion)
+TARGET_LINK_LIBRARIES(ynnpack_subgraph_loop_fusion_test ynnpack_composites)
 YNN_ADD_SUBGRAPH_TEST(subgraphs)
 YNN_ADD_SUBGRAPH_TEST(eliminate_common_subgraphs)
 YNN_ADD_SUBGRAPH_TEST(fold_constants)

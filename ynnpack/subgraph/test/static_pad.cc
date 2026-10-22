@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <tuple>
@@ -25,6 +27,28 @@
 using ynn::to_string;  // NOLINT(misc-unused-using-decls)
 
 namespace ynn {
+
+TEST(Pad, singleton_with_crop_and_nonfinite_values) {
+  for (float value : {2.0f, std::numeric_limits<float>::infinity(),
+                     -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+    SubgraphBuilder builder(2);
+    const auto fill = builder.DefineScalar<float>(7);
+    builder.AddInput(ynn_type_fp32, {1, 2}, 0)
+        .AddOutput(ynn_type_fp32, 2, 1)
+        .AddPad({0, 1}, {1, -1}, {2, 1}, 0, fill, 1);
+    Runtime runtime(builder.GetSubgraph());
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+    std::vector<float> input{value, value}, output(8);
+    runtime.ReshapeExternalTensor({1, 2}, input.data(), 0)
+        .SetupExternalTensor(output.data(), 1).ReshapeRuntime().InvokeRuntime();
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+    EXPECT_EQ(runtime.GetExternalTensorShape(1), std::vector<size_t>({4, 2}));
+    for (size_t index = 0; index < output.size(); ++index) {
+      if (index == 2 && std::isnan(value)) EXPECT_TRUE(std::isnan(output[index]));
+      else EXPECT_EQ(output[index], index == 2 ? value : 7.0f);
+    }
+  }
+}
 
 template <typename Rng>
 std::vector<int64_t> random_padding(Rng& rng, size_t rank, int64_t min,
@@ -79,11 +103,6 @@ void TestImpl(T, size_t rank) {
     std::vector<int64_t> post_padding = random_padding(rng, rank, -3, 3);
 
     for (int i = static_cast<int>(rank) - 1; i >= 0; --i) {
-      if (input_shape[i] == 1) {
-        // TODO: b/510492094 - Avoid weird edge case where if the extent is 1,
-        // it becomes a broadcast dimension, which doesn't get padding.
-        input_shape[i] = 0;
-      }
       if (bool_dist(rng)) {
         // Randomly remove dimensions from the padding op. To implement the
         // reference result, just set the padding to 0.

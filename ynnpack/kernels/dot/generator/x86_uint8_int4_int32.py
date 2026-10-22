@@ -133,8 +133,8 @@ class x86_avx512_uint8_int4_int32(x86_uint8_int4_int32, x86_avx512):
 namespace {
 
 YNN_INTRINSIC __m512i _mm512_hadd_epi32(__m512i a, __m512i b) {
-    a = _mm512_add_epi32(a, _mm512_shuffle_epi32(a, _MM_SHUFFLE(2, 3, 0, 1)));
-    b = _mm512_add_epi32(b, _mm512_shuffle_epi32(b, _MM_SHUFFLE(2, 3, 0, 1)));
+  a = _mm512_add_epi32(a, _mm512_shuffle_epi32(a, _MM_PERM_CDAB));
+  b = _mm512_add_epi32(b, _mm512_shuffle_epi32(b, _MM_PERM_CDAB));
     return _mm512_permutex2var_epi32(a,
         _mm512_setr_epi32(0, 2, 16, 18, 4, 6, 20, 22, 8, 10, 24, 26, 12, 14, 28, 30),
         b
