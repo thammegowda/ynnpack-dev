@@ -138,6 +138,18 @@ std::vector<unary_params> get_params_for_op(ynn_unary_operator op) {
           unary_params{.poly3 = poly3_params{1.0f, 1.0f, 1.0f, 1.0f}},
           unary_params{.poly3 = poly3_params{0.5f, 0.2f, 0.1f, 0.1f}},
       };
+    case ynn_unary_sqrt:
+      return {
+          unary_params{.sqrt = sqrt_params{0.0f, 1.0f}},
+          unary_params{.sqrt = sqrt_params{0.5f, 1.0f}},
+          unary_params{.sqrt = sqrt_params{0.5f, 1.5f}},
+      };
+    case ynn_unary_rsqrt:
+      return {
+          unary_params{.rsqrt = rsqrt_params{0.0f, 1.0f}},
+          unary_params{.rsqrt = rsqrt_params{0.5f, 1.0f}},
+          unary_params{.rsqrt = rsqrt_params{0.5f, 1.5f}},
+      };
     default:
       return {get_unary_params(op)};
   }

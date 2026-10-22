@@ -73,4 +73,79 @@ TEST(SubByteTypesRegression, TiledConvert2Bit) {
   }
 }
 
+void TestInt4TransposeDequantize(bool tensor_params) {
+  constexpr size_t row_count = 4;
+  constexpr size_t column_count = 4;
+  auto value = [](size_t row, size_t column) -> int8_t {
+    return static_cast<int8_t>(row * column_count + column) - 8;
+  };
+  std::vector<uint8_t> packed(row_count * column_count / 2, 0);
+  for (size_t index = 0; index < row_count * column_count; ++index) {
+    const uint8_t nibble =
+        static_cast<uint8_t>(value(index / column_count, index % column_count));
+    packed[index / 2] |= (nibble & 0xF) << (4 * (index % 2));
+  }
+  const std::vector<float> scales(tensor_params ? column_count * row_count : 1,
+                                   1.0f);
+  const std::vector<int32_t> zero_points(column_count * row_count, 0);
+  ynn_subgraph_t subgraph = nullptr;
+  ASSERT_EQ(ynn_create_subgraph(1, 0, &subgraph), ynn_status_success);
+  uint32_t output_id = 0;
+  ASSERT_EQ(ynn_define_tensor(subgraph, ynn_type_fp32, 2, nullptr, nullptr,
+                              YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
+            ynn_status_success);
+  const size_t dimensions[2] = {row_count, column_count};
+  uint32_t int4_id = YNN_INVALID_VALUE_ID;
+  ASSERT_EQ(ynn_define_tensor(subgraph, ynn_type_int4, 2, dimensions,
+                              packed.data(), 0, &int4_id),
+            ynn_status_success);
+  const int32_t permutation[2] = {1, 0};
+  uint32_t transposed_id = YNN_INVALID_VALUE_ID;
+  ASSERT_EQ(ynn_define_static_transpose(subgraph, 2, permutation, int4_id,
+                                        &transposed_id, 0),
+            ynn_status_success);
+  const size_t parameter_dimensions[2] = {column_count, row_count};
+  const size_t parameter_rank = tensor_params ? 2 : 0;
+  uint32_t scale_id = YNN_INVALID_VALUE_ID;
+  ASSERT_EQ(ynn_define_tensor(subgraph, ynn_type_fp32, parameter_rank,
+                              parameter_dimensions, scales.data(),
+                              YNN_VALUE_FLAG_COPY_DATA, &scale_id),
+            ynn_status_success);
+  uint32_t zero_point_id = YNN_INVALID_VALUE_ID;
+  if (tensor_params) {
+    ASSERT_EQ(ynn_define_tensor(subgraph, ynn_type_int32, parameter_rank,
+                                parameter_dimensions, zero_points.data(),
+                                YNN_VALUE_FLAG_COPY_DATA, &zero_point_id),
+              ynn_status_success);
+  }
+  ASSERT_EQ(ynn_define_dequantize(subgraph, transposed_id, zero_point_id,
+                                  scale_id, ynn_type_fp32, &output_id, 0),
+            ynn_status_success);
+  ASSERT_EQ(ynn_optimize_subgraph(subgraph, nullptr, 0), ynn_status_success);
+  ynn_runtime_t runtime = nullptr;
+  ASSERT_EQ(ynn_create_runtime(subgraph, nullptr, 0, &runtime),
+            ynn_status_success);
+  ASSERT_EQ(ynn_reshape_runtime(runtime), ynn_status_success);
+  std::vector<float> output(column_count * row_count, -100.0f);
+  ASSERT_EQ(ynn_set_external_value_data(runtime, output_id, output.data()),
+            ynn_status_success);
+  ASSERT_EQ(ynn_invoke_runtime(runtime), ynn_status_success);
+  ynn_delete_runtime(runtime);
+  ynn_delete_subgraph(subgraph);
+  for (size_t column = 0; column < column_count; ++column) {
+    for (size_t row = 0; row < row_count; ++row) {
+      EXPECT_EQ(output[column * row_count + row],
+                static_cast<float>(value(row, column)));
+    }
+  }
+}
+
+TEST(SubByteTypesRegression, Int4TransposeDequantizeScalarParams) {
+  TestInt4TransposeDequantize(false);
+}
+
+TEST(SubByteTypesRegression, Int4TransposeDequantizeTensorParams) {
+  TestInt4TransposeDequantize(true);
+}
+
 }  // namespace ynn

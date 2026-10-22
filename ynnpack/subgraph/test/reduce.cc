@@ -604,4 +604,46 @@ TEST(MaxAbsDiff, Test) {
   }
 }
 
+TEST(ReduceTest, BroadcastPartialReduction) {
+  const std::vector<size_t> input_shape = {1024};
+  const std::vector<size_t> expanded_shape = {1, 1024, 1};
+  const std::vector<size_t> broadcast_shape = {2, 1024, 1024};
+  const uint32_t input_id = 0;
+  const uint32_t output_id = 1;
+  uint32_t expanded_id = YNN_INVALID_VALUE_ID;
+  uint32_t broadcast_id = YNN_INVALID_VALUE_ID;
+
+  SubgraphBuilder subgraph(2);
+  subgraph.AddInput(ynn_type_fp32, input_shape, input_id)
+      .AddOutput(ynn_type_fp32, TensorShape(), output_id)
+      .AddTensor(ynn_type_fp32, expanded_shape, expanded_id)
+      .AddTensor(ynn_type_fp32, broadcast_shape, broadcast_id);
+  subgraph.AddExpandDims({0, 2}, input_id, expanded_id)
+      .AddStaticBroadcast(broadcast_shape, expanded_id, broadcast_id)
+      .AddReduce(ynn_reduce_sum, {0, 1, 2}, broadcast_id,
+                 YNN_INVALID_VALUE_ID, output_id);
+
+  TestScheduler scheduler(4);
+  if (TestScheduler::num_threads_impl(&scheduler) < 2) {
+    GTEST_SKIP() << "Parallel reduction requires multiple worker threads.";
+  }
+  Runtime runtime(subgraph.GetSubgraph(), &scheduler);
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+  Tensor<float> input(input_shape);
+  input.fill(1.0f);
+  runtime.ReshapeExternalTensor(input_shape, input.data(), input_id);
+  runtime.ReshapeRuntime();
+  ASSERT_EQ(runtime.Status(), ynn_status_success);
+  ASSERT_EQ(runtime.GetExternalTensorShape(output_id), std::vector<size_t>{});
+
+  float output = 0.0f;
+  runtime.SetupExternalTensor(&output, output_id);
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    output = 0.0f;
+    runtime.InvokeRuntime();
+    ASSERT_EQ(runtime.Status(), ynn_status_success);
+    EXPECT_EQ(output, 2097152.0f);
+  }
+}
+
 }  // namespace ynn

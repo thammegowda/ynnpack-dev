@@ -743,6 +743,29 @@ TEST(fusion, reduce_static_transpose_identity) {
   EXPECT_EQ(reduce_op.k_dims, 0b010);
 }
 
+TEST(fusion, reduce_static_transpose_with_init) {
+  const uint32_t input_id = 0;
+  uint32_t transposed_id = 1;
+  uint32_t init_id = 2;
+  const uint32_t output_id = 3;
+  SubgraphBuilder builder(4);
+  builder.AddInput(ynn_type_fp32, 3, input_id)
+    .AddOutput(ynn_type_fp32, 2, output_id)
+    .AddTensor(ynn_type_fp32, 3, transposed_id)
+    .AddInput(ynn_type_fp32, 2, init_id);
+  builder.AddTranspose({2, 0, 1}, input_id, transposed_id)
+    .AddReduce(ynn_reduce_sum, {1}, transposed_id, init_id, output_id, 0);
+
+  ynn_subgraph& subgraph = *builder.GetSubgraph();
+  ASSERT_EQ(subgraph.fusion(), ynn_status_success);
+  subgraph.invalidate_dead_values();
+  ASSERT_THAT(subgraph, HasValidNodeCount(2));
+  EXPECT_TRUE(std::holds_alternative<ynn_node::static_transpose>(
+    ProducerOf(transposed_id, subgraph).op));
+  EXPECT_THAT(ProducerOf(output_id, subgraph),
+        AllOf(IsReduce(ynn_reduce_sum), InputsAre(transposed_id, init_id)));
+}
+
 TEST(fusion, reduce_new_dimension_static_transpose) {
   const uint32_t x_id = 0;
   uint32_t transposed_id = 1;
