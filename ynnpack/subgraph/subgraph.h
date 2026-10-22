@@ -263,6 +263,12 @@ struct ynn_node {
       switch (a.op) {
         case ynn_unary_exp:
           return a.params.exp == b.params.exp;
+        case ynn_unary_expm1:
+          return a.params.expm1 == b.params.expm1;
+        case ynn_unary_log:
+          return a.params.log == b.params.log;
+        case ynn_unary_log1p:
+          return a.params.log1p == b.params.log1p;
         case ynn_unary_erf:
           return a.params.erf == b.params.erf;
         case ynn_unary_approx_erf:
@@ -271,8 +277,14 @@ struct ynn_node {
           return a.params.approx_tanh == b.params.approx_tanh;
         case ynn_unary_tanh:
           return a.params.tanh == b.params.tanh;
+        case ynn_unary_sin:
+          return a.params.sin == b.params.sin;
+        case ynn_unary_cos:
+          return a.params.cos == b.params.cos;
         case ynn_unary_poly3:
           return a.params.poly3 == b.params.poly3;
+        case ynn_unary_sqrt:
+          return a.params.sqrt == b.params.sqrt;
         case ynn_unary_rsqrt:
           return a.params.rsqrt == b.params.rsqrt;
         default:
@@ -286,6 +298,12 @@ struct ynn_node {
       switch (a.op) {
         case ynn_unary_exp:
           return a.params.exp < b.params.exp;
+        case ynn_unary_expm1:
+          return a.params.expm1 < b.params.expm1;
+        case ynn_unary_log:
+          return a.params.log < b.params.log;
+        case ynn_unary_log1p:
+          return a.params.log1p < b.params.log1p;
         case ynn_unary_erf:
           return a.params.erf < b.params.erf;
         case ynn_unary_approx_erf:
@@ -294,8 +312,14 @@ struct ynn_node {
           return a.params.approx_tanh < b.params.approx_tanh;
         case ynn_unary_tanh:
           return a.params.tanh < b.params.tanh;
+        case ynn_unary_sin:
+          return a.params.sin < b.params.sin;
+        case ynn_unary_cos:
+          return a.params.cos < b.params.cos;
         case ynn_unary_poly3:
           return a.params.poly3 < b.params.poly3;
+        case ynn_unary_sqrt:
+          return a.params.sqrt < b.params.sqrt;
         case ynn_unary_rsqrt:
           return a.params.rsqrt < b.params.rsqrt;
         default:

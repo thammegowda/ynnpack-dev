@@ -981,6 +981,15 @@ bool outputs_are_compatible(const ynn_subgraph& subgraph,
     if (a_output.type != b_output.type) {
       return false;
     }
+    if (a_output.rank() != b_output.rank()) {
+      return false;
+    }
+    for (size_t dimension = 0; dimension < a_output.extents.size(); ++dimension) {
+      if (!slinky::prove_true(a_output.extent(dimension) ==
+                              b_output.extent(dimension))) {
+        return false;
+      }
+    }
   }
   return true;
 }
