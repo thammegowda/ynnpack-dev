@@ -85,6 +85,18 @@ cmake --build build-test
 ctest --test-dir build-test --output-on-failure
 ```
 
+Native builds register dot cases individually so CTest can run them in parallel
+without shortening their five-second fuzz budgets. To run just these cases with
+eight workers:
+
+```sh
+ctest --test-dir build-test --parallel 8 --output-on-failure -R '^ynnpack_subgraph_dot_test'
+```
+
+Cross-compiled builds retain a single dot test entry to avoid executing target
+binaries during test discovery. CI already selects parallelism from the runner's
+CPU count.
+
 Add `-DYNNPACK_BUILD_BENCHMARKS=ON` to build the microbenchmarks.
 
 ## Embed with CMake

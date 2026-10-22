@@ -29,7 +29,16 @@ FUNCTION(YNN_ADD_SUBGRAPH_TEST NAME)
     gtest
     gtest_main
   )
-  ADD_TEST(NAME ynnpack_subgraph_${NAME}_test COMMAND ynnpack_subgraph_${NAME}_test)
+  IF(NAME STREQUAL "dot" AND NOT CMAKE_CROSSCOMPILING)
+    INCLUDE(GoogleTest)
+    GTEST_DISCOVER_TESTS(ynnpack_subgraph_${NAME}_test
+      TEST_PREFIX "ynnpack_subgraph_${NAME}_test."
+      NO_PRETTY_VALUES
+      DISCOVERY_TIMEOUT 30
+    )
+  ELSE()
+    ADD_TEST(NAME ynnpack_subgraph_${NAME}_test COMMAND ynnpack_subgraph_${NAME}_test)
+  ENDIF()
 ENDFUNCTION()
 
 YNN_ADD_SUBGRAPH_TEST(broadcast_like)
