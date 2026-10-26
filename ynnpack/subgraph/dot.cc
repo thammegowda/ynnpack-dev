@@ -471,6 +471,24 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool symmetric_b,
              b_k_strides[0], b, init_c_stride_m, init_c, c_stride_m, c, state);
     };
 
+    const auto broadcast_batch = [&c](const slinky::raw_buffer& input) {
+        slinky::buffer<const void, max_tensor_rank> result = input;
+        for (size_t dimension = 0; dimension < input.rank; ++dimension) {
+            if (input.dim(dimension).extent() == 1) {
+                auto& batch = result.mutable_dim(dimension);
+                batch.set_bounds(c.dim(dimension).min(), c.dim(dimension).max());
+                batch.set_stride(0);
+            }
+        }
+        return result;
+    };
+    auto batch_a = broadcast_batch(a);
+    auto batch_b = broadcast_batch(b);
+    auto batch_init_c = broadcast_batch(init_c);
+    a = batch_a;
+    b = batch_b;
+    init_c = batch_init_c;
+
     dot_kernel_state kernel_state = {};
 
     const size_t cache_sizes[] = {cache_size_l2};
