@@ -1,4 +1,5 @@
 #include "ynnpack/include/ynnpack_cuda.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -506,6 +507,188 @@ void check_projection_rebinding(int device) {
         }
     }
 }
+
+void check_descriptor_validation(int device) {
+    using namespace ynn::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    Buffer buffer(allocate(256 * sizeof(float), device), release);
+    const auto rejected = [&](const Descriptor& descriptor) {
+        try {
+            Program program(descriptor, device);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    Descriptor descriptor;
+    descriptor.input_count = 1;
+    descriptor.inputs[0] = Tensor{buffer.get(), Type::F32, 3, {1, 2, 8}, device};
+    for (const auto operation :
+         {Op::ADD, Op::MULTIPLY, Op::MATMUL, Op::LINEAR, Op::GATHER, Op::RMS_NORM, Op::LAYER_NORM, Op::ROTARY,
+          Op::PACKED_LINEAR, Op::QUANTIZED_LINEAR, Op::ATTENTION, Op::EMBEDDING_SUM, Op::DIFFUSION_UPDATE}) {
+        descriptor.operation = operation;
+        if (!rejected(descriptor)) throw std::runtime_error("CUDA accepted an operation with too few inputs");
+    }
+
+    Descriptor attention;
+    attention.operation = Op::ATTENTION;
+    attention.input_count = 3;
+    for (int index = 0; index < 3; ++index)
+        attention.inputs[index] = Tensor{buffer.get(), Type::F32, 3, {1, 4, 8}, device};
+    attention.attribute_count = 1;
+    for (const std::int64_t heads : {0, 3, 16}) {
+        attention.attributes[0] = heads;
+        if (!rejected(attention)) throw std::runtime_error("CUDA accepted invalid attention heads");
+    }
+    attention.attribute_count = 4;
+    attention.attributes = {2, 2, 3, 2};
+    if (!rejected(attention)) throw std::runtime_error("CUDA accepted attention keys beyond the cache");
+    attention.attributes = {2, 2, 2, 2};
+    if (rejected(attention)) throw std::runtime_error("CUDA rejected valid attention");
+}
+
+void check_relocated_scatter(int device) {
+    using namespace ynn::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    const std::array<std::int32_t, 8> values{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::array<std::int32_t, 2> rows{3, 1}, stale{0, 0};
+    std::array<std::int32_t, 16> initial{}, original{}, moved{};
+    Buffer cache(allocate(sizeof(initial), device), release), target(allocate(sizeof(initial), device), release),
+        updates(allocate(sizeof(values), device), release), indices(allocate(sizeof(rows), device), release),
+        stale_indices(allocate(sizeof(stale), device), release), table(allocate(2 * sizeof(void*), device), release);
+    copy_to_device(cache.get(), initial.data(), sizeof(initial), device);
+    copy_to_device(target.get(), initial.data(), sizeof(initial), device);
+    copy_to_device(updates.get(), values.data(), sizeof(values), device);
+    copy_to_device(indices.get(), rows.data(), sizeof(rows), device);
+    copy_to_device(stale_indices.get(), stale.data(), sizeof(stale), device);
+    const std::array<void*, 2> current{target.get(), indices.get()};
+    copy_to_device(table.get(), current.data(), sizeof(current), device);
+    const auto* slots = static_cast<void* const*>(table.get());
+    const std::array<TensorBinding, 2> bindings{TensorBinding{cache.get(), sizeof(initial), slots},
+                                                TensorBinding{stale_indices.get(), sizeof(stale), slots + 1}};
+    const std::array<Tensor, 3> inputs{Tensor{cache.get(), Type::I32, 3, {1, 4, 4}, device},
+                                       Tensor{updates.get(), Type::I32, 3, {1, 2, 4}, device},
+                                       Tensor{stale_indices.get(), Type::I32, 1, {2}, device}};
+    Descriptor descriptor;
+    descriptor.operation = Op::SCATTER;
+    descriptor.input_count = 3;
+    std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
+    Program program(descriptor, device);
+    {
+        const BindingScope scope(bindings.data(), bindings.size());
+        program.run(inputs.data(), 3, cache.get());
+    }
+    copy_to_host(original.data(), cache.get(), sizeof(initial), device);
+    copy_to_host(moved.data(), target.get(), sizeof(initial), device);
+    if (original != initial) throw std::runtime_error("CUDA scatter wrote to the address a cache was relocated from");
+    for (std::size_t row = 0; row < 4; ++row)
+        for (std::size_t channel = 0; channel < 4; ++channel) {
+            const auto expected = row == 3 ? values[channel] : row == 1 ? values[4 + channel] : 0;
+            if (moved[row * 4 + channel] != expected)
+                throw std::runtime_error("CUDA scatter ignored its relocated operands");
+        }
+}
+
+void check_relocated_attention(int device) {
+    using namespace ynn::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    constexpr std::int64_t heads = 2, key_heads = 1, keys = 19, offset = 3, capacity = keys + 5;
+    const auto bfloat = [](float number) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &number, sizeof(bits));
+        return static_cast<std::uint16_t>(bits >> 16);
+    };
+    for (const std::int64_t width : {64, 256}) {
+        std::vector<std::uint16_t> query(heads * width), cache(capacity * key_heads * width),
+            zeros(cache.size(), bfloat(0.F));
+        for (std::size_t index = 0; index < query.size(); ++index)
+            query[index] = bfloat(static_cast<float>(static_cast<int>(index * 7 % 31) - 15) * 0.015625F);
+        for (std::size_t index = 0; index < cache.size(); ++index)
+            cache[index] = bfloat(static_cast<float>(static_cast<int>(index * 11 % 31) - 15) * 0.015625F);
+        const auto bytes = cache.size() * sizeof(std::uint16_t);
+        Buffer queries(allocate(query.size() * sizeof(std::uint16_t), device), release),
+            key(allocate(bytes, device), release), value(allocate(bytes, device), release),
+            old_key(allocate(bytes, device), release), old_value(allocate(bytes, device), release),
+            output(allocate(query.size() * sizeof(std::uint16_t), device), release),
+            table(allocate(2 * sizeof(void*), device), release);
+        copy_to_device(queries.get(), query.data(), query.size() * sizeof(std::uint16_t), device);
+        copy_to_device(key.get(), cache.data(), bytes, device);
+        copy_to_device(value.get(), cache.data(), bytes, device);
+        copy_to_device(old_key.get(), zeros.data(), bytes, device);
+        copy_to_device(old_value.get(), zeros.data(), bytes, device);
+        const std::array<void*, 2> current{key.get(), value.get()};
+        copy_to_device(table.get(), current.data(), sizeof(current), device);
+        const auto* slots = static_cast<void* const*>(table.get());
+        const std::array<TensorBinding, 2> bindings{TensorBinding{old_key.get(), bytes, slots},
+                                                    TensorBinding{old_value.get(), bytes, slots + 1}};
+        const auto operands = [&](std::int64_t rows, void* keys_data, void* values_data) {
+            return std::array<Tensor, 3>{Tensor{queries.get(), Type::BF16, 3, {1, rows, heads * width}, device},
+                                         Tensor{keys_data, Type::BF16, 3, {1, capacity, key_heads * width}, device},
+                                         Tensor{values_data, Type::BF16, 3, {1, capacity, key_heads * width}, device}};
+        };
+        Descriptor descriptor;
+        descriptor.operation = Op::ATTENTION;
+        descriptor.input_count = 3;
+        const auto fixed = operands(1, key.get(), value.get());
+        std::copy(fixed.begin(), fixed.end(), descriptor.inputs.begin());
+        descriptor.attribute_count = 4;
+        descriptor.attributes = {heads, key_heads, offset, keys};
+        Program program(descriptor, device);
+        const auto result = [&](const std::array<Tensor, 3>& inputs) {
+            std::vector<std::uint16_t> values(query.size());
+            program.run(inputs.data(), 3, output.get());
+            copy_to_host(values.data(), output.get(), values.size() * sizeof(std::uint16_t), device);
+            return values;
+        };
+        const auto expected = result(fixed);
+        const auto moved = operands(1, old_key.get(), old_value.get());
+        if (result(moved) == expected) throw std::runtime_error("CUDA relocation test cannot tell stale caches apart");
+        {
+            const BindingScope scope(bindings.data(), bindings.size());
+            if (result(moved) != expected) throw std::runtime_error("CUDA decode attention ignored a relocated cache");
+        }
+        auto prefill = descriptor;
+        const auto prefill_inputs = operands(2, old_key.get(), old_value.get());
+        std::copy(prefill_inputs.begin(), prefill_inputs.end(), prefill.inputs.begin());
+        Program batched(prefill, device);
+        const BindingScope scope(bindings.data(), bindings.size());
+        bool rejected = false;
+        try {
+            batched.run(prefill_inputs.data(), 3, output.get());
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        if (!rejected) throw std::runtime_error("CUDA accepted a relocated cache in a multi-query attention");
+    }
+}
+
+void check_relocation_limits(int device) {
+    using namespace ynn::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    const std::array<float, 4> numbers{1, 2, 3, 4};
+    Buffer left(allocate(sizeof(numbers), device), release), right(allocate(sizeof(numbers), device), release),
+        output(allocate(sizeof(numbers), device), release), table(allocate(sizeof(void*), device), release);
+    copy_to_device(left.get(), numbers.data(), sizeof(numbers), device);
+    copy_to_device(right.get(), numbers.data(), sizeof(numbers), device);
+    const void* current = right.get();
+    copy_to_device(table.get(), &current, sizeof(current), device);
+    const TensorBinding binding{left.get(), sizeof(numbers), static_cast<void* const*>(table.get())};
+    const std::array<Tensor, 2> inputs{Tensor{left.get(), Type::F32, 1, {4}, device},
+                                       Tensor{right.get(), Type::F32, 1, {4}, device}};
+    Descriptor descriptor;
+    descriptor.operation = Op::ADD;
+    descriptor.input_count = 2;
+    std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
+    Program program(descriptor, device);
+    const BindingScope scope(&binding, 1);
+    bool rejected = false;
+    try {
+        program.run(inputs.data(), 2, output.get());
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    if (!rejected) throw std::runtime_error("CUDA accepted a relocated operand on a path that ignores relocation");
+}
 } // namespace
 
 int main() {
@@ -548,6 +731,10 @@ int main() {
                 for (const int width : {8, 256, 1536, 6144, 12288}) check_bfloat_matrix(device, rows, width);
             check_mixed_matrix(device);
             check_projection_rebinding(device);
+            check_descriptor_validation(device);
+            check_relocated_scatter(device);
+            check_relocated_attention(device);
+            check_relocation_limits(device);
             auto selected_inputs = std::array<Tensor, 2>{inputs[0], inputs[1]};
             selected_inputs[0].device = selected_inputs[1].device = device;
             selected_inputs[0].data = allocate(sizeof(left), device);

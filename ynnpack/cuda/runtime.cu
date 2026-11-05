@@ -708,7 +708,7 @@ __global__ void scatter_updates(Launch plan) {
     if (index >= plan.elements) return;
     const auto width = plan.inputs[1].shape[2], rows = plan.inputs[1].shape[1];
     const auto row = index / width % rows, batch = index / (width * rows);
-    const auto* indices = static_cast<const int*>(plan.inputs[2].data);
+    const auto* indices = static_cast<const int*>(address(plan.inputs[2]));
     const auto target = indices[row];
     if (target < 0 || target >= plan.output.shape[1]) return;
     for (std::int64_t later = row + 1; later < rows; ++later)
@@ -1448,10 +1448,75 @@ struct PreparedMatrix {
     }
 };
 
+int minimum_inputs(const Descriptor& descriptor) {
+    const auto operation = descriptor.operation;
+    switch (operation) {
+        case Op::ADD:
+        case Op::MULTIPLY:
+        case Op::MATMUL:
+        case Op::LINEAR:
+        case Op::GATHER:
+        case Op::RMS_NORM:
+        case Op::GELU_MULTIPLY:
+        case Op::SILU_MULTIPLY:
+        case Op::SNAKE:
+        case Op::CONV_TRANSPOSE_FOLD:
+            return 2;
+        case Op::LAYER_NORM:
+        case Op::RMS_NORM_RESIDUAL:
+        case Op::ROTARY:
+        case Op::PACKED_LINEAR:
+        case Op::ATTENTION:
+        case Op::SCATTER:
+        case Op::DIFFUSION_UPDATE:
+            return 3;
+        case Op::RESIDUAL_NORM:
+        case Op::RMS_ROTARY:
+        case Op::QUANTIZED_LINEAR:
+            return 4;
+        case Op::EMBEDDING:
+        case Op::EMBEDDING_SUM:
+            // Quantized tables carry a scale operand.
+            return descriptor.attribute_count >= 2 && descriptor.attributes[1] ? 3 : 2;
+        case Op::CONV1D:
+        case Op::SNAKE_CONV1D:
+        case Op::SNAKE_QUANTIZED_LINEAR: {
+            const int weight = operation == Op::CONV1D ? 1 : 2;
+            if (descriptor.input_count <= weight) return weight + 1;
+            return weight + (descriptor.inputs[weight].type == Type::I8 ? 3 : 2);
+        }
+        default:
+            return 1;
+    }
+}
+
+void validate_attention(const Descriptor& descriptor) {
+    const auto& query = descriptor.inputs[0];
+    const auto& key = descriptor.inputs[1];
+    const auto& value = descriptor.inputs[2];
+    const auto count = descriptor.attribute_count;
+    const std::int64_t heads = count >= 1 ? descriptor.attributes[0] : 0;
+    const std::int64_t key_heads = count >= 2 ? descriptor.attributes[1] : heads;
+    const std::int64_t offset = count >= 3 ? descriptor.attributes[2] : 0;
+    if (descriptor.input_count > 4 || query.rank != 3 || key.rank != 3 || value.rank != 3 || heads <= 0 ||
+        key_heads <= 0 || heads % key_heads || query.shape[2] % heads ||
+        key.shape[2] != key_heads * (query.shape[2] / heads) ||
+        !std::equal(key.shape.begin(), key.shape.begin() + 3, value.shape.begin()) ||
+        (key.shape[0] != 1 && key.shape[0] != query.shape[0]))
+        throw std::runtime_error("CUDA: invalid attention geometry");
+    const std::int64_t keys = count >= 4 ? descriptor.attributes[3] : key.shape[1];
+    if (offset < 0 || keys < 0 || offset > key.shape[1] || keys > key.shape[1] - offset)
+        throw std::runtime_error("CUDA: attention keys exceed the cache");
+}
+
 void infer(Descriptor& descriptor) {
     if (descriptor.input_count < 1 || descriptor.input_count > 8) throw std::runtime_error("CUDA: invalid input count");
     if (descriptor.attribute_count < 0 || descriptor.attribute_count > 32)
         throw std::runtime_error("CUDA: invalid attribute count");
+    const auto required = minimum_inputs(descriptor);
+    if (descriptor.input_count < required)
+        throw std::runtime_error("CUDA: operation " + std::to_string(static_cast<int>(descriptor.operation)) +
+                                 " requires at least " + std::to_string(required) + " inputs");
     for (int index = 0; index < descriptor.input_count; ++index) {
         descriptor.inputs[index].elements();
         switch (descriptor.inputs[index].type) {
@@ -1501,8 +1566,10 @@ void infer(Descriptor& descriptor) {
         case Op::ROTARY:
         case Op::GELU_MULTIPLY:
         case Op::SILU_MULTIPLY:
-        case Op::ATTENTION:
         case Op::SNAKE:
+            break;
+        case Op::ATTENTION:
+            validate_attention(descriptor);
             break;
         case Op::SCATTER:
             if (descriptor.input_count != 3 || input.rank != 3 || descriptor.inputs[1].rank != 3 ||
@@ -2005,8 +2072,13 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     launch.elements = descriptor.output.elements();
     if (!launch.elements) return;
     if (!output) throw std::runtime_error("CUDA: null output pointer");
-    const auto blocks = static_cast<unsigned int>((launch.elements + 255) / 256);
     const auto operation = descriptor.operation;
+    const bool relocated =
+        launch.output.binding ||
+        std::any_of(launch.inputs, launch.inputs + count, [](const View& tensor) { return tensor.binding != nullptr; });
+    if (relocated && operation != Op::SCATTER && !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1))
+        throw std::runtime_error("CUDA: relocated operands are only supported by scatter and single-query attention");
+    const auto blocks = static_cast<unsigned int>((launch.elements + 255) / 256);
     if (operation == Op::CONV1D || operation == Op::SNAKE_CONV1D || operation == Op::SNAKE_QUANTIZED_LINEAR) {
         const bool convolution = operation != Op::SNAKE_QUANTIZED_LINEAR;
         const bool snake = operation != Op::CONV1D;

@@ -471,6 +471,8 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool symmetric_b,
              b_k_strides[0], b, init_c_stride_m, init_c, c_stride_m, c, state);
     };
 
+    // a, b, init_c and c were sliced down to their batch dimensions above, so
+    // dimension i is the same axis in each.
     const auto broadcast_batch = [&c](const slinky::raw_buffer& input) {
         slinky::buffer<const void, max_tensor_rank> result = input;
         for (size_t dimension = 0; dimension < input.rank; ++dimension) {

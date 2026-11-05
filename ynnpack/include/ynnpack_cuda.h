@@ -93,6 +93,7 @@ void synchronize(int device = 0);
 std::size_t allocated_bytes(int device = -1) noexcept;
 std::size_t peak_allocated_bytes(int device = -1) noexcept;
 
+// A bound operand is read through its device-side slot; only scatter and single-query attention accept one.
 struct TensorBinding {
     const void* data;
     std::size_t bytes;
