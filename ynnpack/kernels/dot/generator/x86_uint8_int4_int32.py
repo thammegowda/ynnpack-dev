@@ -127,6 +127,7 @@ class x86_avx512_uint8_int4_int32(x86_uint8_int4_int32, x86_avx512):
 
   def __init__(self, arch="avx512", vector_bits=512):
     super().__init__(arch, vector_bits, tile_shape=(1, 16, 8))
+    self.b_prefetch_bytes = 4096
 
   def header(self):
     return super().header() + """

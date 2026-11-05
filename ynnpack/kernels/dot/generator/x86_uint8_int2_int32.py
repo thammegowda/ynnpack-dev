@@ -137,6 +137,7 @@ class x86_avx512_uint8_int2_int32(x86_uint8_int2_int32, x86_avx512):
 
   def __init__(self, arch="avx512", vector_bits=512):
     super().__init__(arch, vector_bits, tile_shape=(1, 16, 16))
+    self.b_prefetch_bytes = 4096
 
 
 class x86_avx512vnni_uint8_int2_int32(x86_avx512_uint8_int2_int32):

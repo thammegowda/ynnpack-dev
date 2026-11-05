@@ -983,7 +983,10 @@ std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
   // - Tasks shouldn't be too large, so we get enough parallelism.
   const index_t min_area_2d =
       std::min<index_t>(m, 64) * std::min<index_t>(n, 64);
-  const index_t min_area_1d = 256;
+  index_t min_area_1d = 256;
+#if defined(__x86_64__) || defined(_M_X64)
+  if (m == 1 && a_elem_size == 1) min_area_1d = 64;
+#endif
   const index_t min_area = std::max<index_t>(min_area_2d, min_area_1d);
   const index_t max_area = 256 * 256;
   // The maximum cost of a tile, according to the cost function (m + n) * k.

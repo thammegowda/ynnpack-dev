@@ -18,6 +18,7 @@ class x86_avx512vnni_uint8_int8_int32(x86_avx512):
     self.a_type = "uint8_t"
     self.b_type = "int8_t"
     self.flags += ["dot_flag::consistent_arithmetic"]
+    self.b_prefetch_bytes = 4096
 
   def header(self):
     return super().header() + """
