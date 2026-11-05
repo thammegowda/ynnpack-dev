@@ -471,6 +471,26 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool symmetric_b,
              b_k_strides[0], b, init_c_stride_m, init_c, c_stride_m, c, state);
     };
 
+    // a, b, init_c and c were sliced down to their batch dimensions above, so
+    // dimension i is the same axis in each.
+    const auto broadcast_batch = [&c](const slinky::raw_buffer& input) {
+        slinky::buffer<const void, max_tensor_rank> result = input;
+        for (size_t dimension = 0; dimension < input.rank; ++dimension) {
+            if (input.dim(dimension).extent() == 1) {
+                auto& batch = result.mutable_dim(dimension);
+                batch.set_bounds(c.dim(dimension).min(), c.dim(dimension).max());
+                batch.set_stride(0);
+            }
+        }
+        return result;
+    };
+    auto batch_a = broadcast_batch(a);
+    auto batch_b = broadcast_batch(b);
+    auto batch_init_c = broadcast_batch(init_c);
+    a = batch_a;
+    b = batch_b;
+    init_c = batch_init_c;
+
     dot_kernel_state kernel_state = {};
 
     const size_t cache_sizes[] = {cache_size_l2};
@@ -965,7 +985,10 @@ std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
   // - Tasks shouldn't be too large, so we get enough parallelism.
   const index_t min_area_2d =
       std::min<index_t>(m, 64) * std::min<index_t>(n, 64);
-  const index_t min_area_1d = 256;
+  index_t min_area_1d = 256;
+#if defined(__x86_64__) || defined(_M_X64)
+  if (m == 1 && a_elem_size == 1) min_area_1d = 64;
+#endif
   const index_t min_area = std::max<index_t>(min_area_2d, min_area_1d);
   const index_t max_area = 256 * 256;
   // The maximum cost of a tile, according to the cost function (m + n) * k.

@@ -60,6 +60,11 @@ class dot_base:
     self.b_chunk_n = 1
     self.min_tiles = 4
     self.flags = []
+    # If non-zero, each B tile load is paired with a prefetch of the data this
+    # many bytes further along. Streaming packed weights is memory bound, and
+    # hardware prefetchers restart at every page boundary, so prefetching a page
+    # ahead raises the bandwidth a thread sustains.
+    self.b_prefetch_bytes = 0
 
   def header(self):
     return """
@@ -238,6 +243,15 @@ void {func_name}(
     """Load one tile of b(k, j)."""
     raise NotImplementedError()
 
+  def prefetch_b_tile(self, k, j):
+    """Prefetch the data `b_prefetch_bytes` past the tile b(k, j)."""
+    if not self.b_prefetch_bytes:
+      return ""
+    return (
+        f"_mm_prefetch({self.b_ptr(k, j, 'char')} + {self.b_prefetch_bytes},"
+        " _MM_HINT_T0);\n"
+    )
+
   def product(self, i, j, k):
     """Compute c(i, j) += a(i, k) * b(k, j)."""
     raise NotImplementedError()
@@ -305,6 +319,7 @@ void {func_name}(
       for k in range(0, self.block_shape[2], self.tile_shape[2]):
         for j in range(0, self.block_shape[1], self.tile_shape[1]):
           result += self.load_b_tile(k, j)
+          result += self.prefetch_b_tile(k, j)
 
       for k in range(0, self.block_shape[2], self.tile_shape[2]):
         for i in range(0, self.block_shape[0], self.tile_shape[0]):

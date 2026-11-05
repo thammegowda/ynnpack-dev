@@ -71,3 +71,9 @@ if(YNNPACK_BUILD_BENCHMARKS AND NOT TARGET benchmark::benchmark)
 endif()
 
 add_subdirectory(ynnpack)
+
+option(YNNPACK_ENABLE_CUDA "Build the CUDA execution backend" OFF)
+if(YNNPACK_ENABLE_CUDA)
+	enable_language(CUDA)
+	add_subdirectory(ynnpack/cuda)
+endif()
