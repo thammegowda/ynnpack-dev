@@ -279,4 +279,147 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
     }
 }
 
+namespace {
+
+float dot_f32_lanes8(const float* left, const float* right, size_t count) {
+    float lanes[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    size_t index = 0;
+    for (; index + 8 <= count; index += 8) {
+        for (size_t lane = 0; lane < 8; ++lane) {
+            lanes[lane] += left[index + lane] * right[index + lane];
+        }
+    }
+    float sum = 0.0f;
+    for (size_t lane = 0; lane < 8; ++lane) sum += lanes[lane];
+    for (; index < count; ++index) sum += left[index] * right[index];
+    return sum;
+}
+
+bool is_single_gqa8_step(const attention_f32_params& params) {
+    return params.batch_size == 1 && params.query_length == 1 && params.key_value_heads == 1 &&
+           params.query_heads == 8 && params.mask_head_stride == 0;
+}
+
+} // namespace
+
+size_t attention_f32_work_items(const attention_f32_params& params) {
+    if (is_single_gqa8_step(params)) return 1;
+    return params.batch_size * params.query_length * params.query_heads;
+}
+
+size_t attention_f32_scratch_size(const attention_f32_params& params) {
+    const size_t keys = params.key_length ? params.key_length : params.total_keys;
+    return (is_single_gqa8_step(params) ? 8 : 1) * keys;
+}
+
+void attention_f32(const attention_f32_params& params, const float* query, const float* key_data,
+                   const float* value_data, const float* mask, float* output_data, size_t item_start, size_t item_end,
+                   float* scratch) {
+    if (params.query_heads == 0 || params.key_value_heads == 0 || params.query_heads % params.key_value_heads != 0) {
+        return;
+    }
+    const size_t rows = params.query_length;
+    const size_t heads = params.query_heads;
+    const size_t key_heads = params.key_value_heads;
+    const size_t head_width = params.head_dim;
+    const size_t width = heads * head_width;
+    const size_t kv_width = key_heads * head_width;
+    const size_t group_size = heads / key_heads;
+    const size_t keys = params.key_length ? params.key_length : params.total_keys;
+
+    if (is_single_gqa8_step(params)) {
+        if (item_start > 0 || item_end == 0) return;
+        const float* k_base = key_data + params.key_start * head_width;
+        const float* v_base = value_data + params.key_start * head_width;
+        size_t active_keys = keys;
+        if (mask != nullptr) {
+            while (active_keys > 0 && mask[(active_keys - 1) * params.mask_key_stride] <= -1e8f) --active_keys;
+        }
+        if (active_keys == 0) {
+            std::fill_n(output_data, width, 0.0f);
+            return;
+        }
+        float largest[8];
+        std::fill_n(largest, 8, -std::numeric_limits<float>::infinity());
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+            const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+            if (b <= -1e8f) {
+                for (size_t h = 0; h < 8; ++h) {
+                    scratch[h * active_keys + k_idx] = -std::numeric_limits<float>::infinity();
+                }
+                continue;
+            }
+            const float* k_row = k_base + k_idx * head_width;
+            for (size_t h = 0; h < 8; ++h) {
+                const float s = dot_f32_lanes8(query + h * head_width, k_row, head_width) * params.scale + b;
+                scratch[h * active_keys + k_idx] = s;
+                largest[h] = std::max(largest[h], s);
+            }
+        }
+        float inv_total[8];
+        for (size_t h = 0; h < 8; ++h) {
+            float total = 0.0f;
+            float* scores = scratch + h * active_keys;
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                scores[k_idx] =
+                    scores[k_idx] == -std::numeric_limits<float>::infinity() ? 0.0f : std::exp(scores[k_idx] - largest[h]);
+                total += scores[k_idx];
+            }
+            inv_total[h] = 1.0f / total;
+        }
+        std::fill_n(output_data, width, 0.0f);
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+            const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+            if (b <= -1e8f) continue;
+            const float* v_row = v_base + k_idx * head_width;
+            for (size_t h = 0; h < 8; ++h) {
+                const float w = scratch[h * active_keys + k_idx] * inv_total[h];
+                float* out_h = output_data + h * head_width;
+                for (size_t index = 0; index < head_width; ++index) out_h[index] += w * v_row[index];
+            }
+        }
+        return;
+    }
+
+    const size_t items = params.batch_size * rows * heads;
+    item_end = std::min(item_end, items);
+    for (size_t item = item_start; item < item_end; ++item) {
+        const size_t row = item % rows;
+        const size_t head = (item / rows) % heads;
+        const size_t sample = item / (rows * heads);
+        const size_t kv_head = head / group_size;
+        const float* q = query + (sample * rows + row) * width + head * head_width;
+        const float* k = key_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* v = value_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* bias = mask != nullptr ? mask + sample * params.mask_batch_stride + head * params.mask_head_stride +
+                                                  row * params.mask_query_stride
+                                            : nullptr;
+        float largest = -std::numeric_limits<float>::infinity();
+        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+            const float b = bias != nullptr ? bias[k_idx * params.mask_key_stride] : 0.0f;
+            if (b <= -1e8f) {
+                scratch[k_idx] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
+            scratch[k_idx] = dot_f32_lanes8(q, k + k_idx * kv_width, head_width) * params.scale + b;
+            largest = std::max(largest, scratch[k_idx]);
+        }
+        float total = 0.0f;
+        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+            scratch[k_idx] =
+                scratch[k_idx] == -std::numeric_limits<float>::infinity() ? 0.0f : std::exp(scratch[k_idx] - largest);
+            total += scratch[k_idx];
+        }
+        const float inv_total = 1.0f / total;
+        float* out = output_data + (sample * rows + row) * width + head * head_width;
+        std::fill_n(out, head_width, 0.0f);
+        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+            if (scratch[k_idx] == 0.0f) continue;
+            const float weight = scratch[k_idx] * inv_total;
+            const float* source = v + k_idx * kv_width;
+            for (size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
+        }
+    }
+}
+
 } // namespace ynn

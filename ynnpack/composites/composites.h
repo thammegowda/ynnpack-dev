@@ -47,6 +47,65 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
                              const int8_t* value, const float* mask, float* output, size_t row_start, size_t row_end,
                              void* scratch);
 
+struct attention_f32_params {
+    size_t batch_size;
+    size_t query_length;
+    size_t query_heads;
+    size_t key_value_heads;
+    size_t key_start;
+    size_t key_length;
+    size_t total_keys;
+    size_t head_dim;
+    size_t key_batch_stride;
+    size_t mask_batch_stride;
+    size_t mask_head_stride;
+    size_t mask_query_stride;
+    size_t mask_key_stride;
+    float scale;
+};
+
+size_t attention_f32_work_items(const attention_f32_params& params);
+size_t attention_f32_scratch_size(const attention_f32_params& params);
+void attention_f32(const attention_f32_params& params, const float* query, const float* key, const float* value,
+                   const float* mask, float* output, size_t item_start, size_t item_end, float* scratch);
+
+bool is_blockwise_linear_supported(int32_t bits);
+size_t blockwise_linear_tile_count(size_t n);
+size_t packed_blockwise_linear_size(int32_t bits, size_t n, size_t k, size_t block_size, bool has_zero);
+void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k, size_t block_size, const void* weights,
+                                 const void* scales, bool scales_fp16, const void* zeros, bool zeros_fp16,
+                                 size_t tile_start, size_t tile_end, void* packed_tiles);
+void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k, size_t block_size, bool compute_bsum,
+                                        const float* input, int8_t* quantized_input, float* input_scales,
+                                        float* input_bsums, size_t row_start, size_t row_end);
+void blockwise_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, bool has_zero,
+                          float output_scale, const void* packed_tiles, const int8_t* quantized_input,
+                          const float* input_scales, const float* input_bsums, float* output, size_t tile_start,
+                          size_t tile_end);
+
+void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
+                                   size_t row_count, size_t col_start, size_t col_count, uint8_t* destination);
+ynn_status silu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end);
+ynn_status gelu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end);
+
+void rms_norm_f32(size_t rows, size_t width, float epsilon, const float* input, const float* weight,
+                  const float* residual, bool has_scale, float scale, float* output, size_t row_start, size_t row_end);
+void rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool shared_angles, const float* input,
+                const float* cosine, const float* sine, float* output, size_t row_start, size_t row_end);
+void rms_rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool sliced, size_t input_rows,
+                    size_t input_stride, size_t sequence_offset, size_t channel_offset, float epsilon,
+                    bool shared_angles, const float* input, const float* weight, const float* cosine, const float* sine,
+                    float* output, size_t vec_start, size_t vec_end);
+
+void dequantize_embedding_f32(const int32_t* tokens, size_t num_tokens, const void* weights, bool weights_bf16,
+                              int32_t packed_bits, bool unsigned_packed, size_t width, size_t groups,
+                              const void* scales, bool scales_fp16, const void* zeros, bool zeros_fp16,
+                              float multiplier, float* output, size_t row_start, size_t row_end);
+void quantize_symmetric_int8_f32(size_t count, float scale, const float* input, int8_t* output);
+void argmax_rows_f32(size_t rows, size_t width, const float* logits, int32_t* tokens);
+
 // gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
 ynn_status define_gelu(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t& output_id);
 

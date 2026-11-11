@@ -7,10 +7,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "ynnpack/composites/composites.h"
 #include "ynnpack/composites/util.h"
 #include "ynnpack/include/ynnpack.h"
+#include "ynnpack/kernels/unary/unary.h"
 
 namespace ynn {
 namespace {
@@ -127,6 +129,81 @@ ynn_status define_packed_feed_forward(
       &fully_scaled_id, 0));
   return define_calibration(subgraph, fully_scaled_id, down_output_scale_id,
                             output_id);
+}
+
+void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
+                                   size_t row_count, size_t col_start, size_t col_count, uint8_t* destination) {
+  const size_t values_per_byte = static_cast<size_t>(8 / bits);
+  const size_t destination_row_bytes = row_count / values_per_byte;
+  std::memset(destination, 0, col_count * destination_row_bytes);
+  const uint8_t mask = static_cast<uint8_t>((1 << bits) - 1);
+  for (size_t row = 0; row < row_count; ++row) {
+    for (size_t column = 0; column < col_count; ++column) {
+      const size_t source_column = col_start + column;
+      const uint8_t value = static_cast<uint8_t>(
+          (source[(row_start + row) * source_stride_bytes + source_column / values_per_byte] >>
+           ((source_column % values_per_byte) * bits)) &
+          mask);
+      destination[column * destination_row_bytes + row / values_per_byte] |=
+          static_cast<uint8_t>(value << ((row % values_per_byte) * bits));
+    }
+  }
+}
+
+ynn_status silu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end) {
+  static const auto sigmoid_kernel = get_unary_kernel(ynn_unary_sigmoid, ynn_type_fp32, ynn_type_fp32);
+  static const auto sigmoid_params = get_unary_params(ynn_unary_sigmoid);
+  if (!sigmoid_kernel) return ynn_status_unsupported_parameter;
+  row_end = std::min(row_end, rows);
+  for (size_t row = row_start; row < row_end; ++row) {
+    const float* gate = input + row * 2 * width;
+    const float* up = gate + width;
+    float* hidden = output + row * width;
+    sigmoid_kernel(1, width, width * sizeof(float), gate, width * sizeof(float), hidden, &sigmoid_params);
+    for (size_t i = 0; i < width; ++i) {
+      hidden[i] = (hidden[i] * gate[i]) * up[i];
+    }
+  }
+  return ynn_status_success;
+}
+
+ynn_status gelu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end) {
+  static const auto tanh_kernel = get_unary_kernel(ynn_unary_tanh, ynn_type_fp32, ynn_type_fp32);
+  static const auto tanh_params = get_unary_params(ynn_unary_tanh);
+  if (!tanh_kernel) return ynn_status_unsupported_parameter;
+  row_end = std::min(row_end, rows);
+  constexpr float kScale = 0.79788456080286535588f;  // sqrt(2 / pi)
+  constexpr size_t kChunk = 1024;
+  for (size_t row = row_start; row < row_end; ++row) {
+    const float* gate = input + row * 2 * width;
+    const float* up = gate + width;
+    float* hidden = output + row * width;
+    for (size_t offset = 0; offset < width; offset += kChunk) {
+      const size_t count = std::min(kChunk, width - offset);
+      {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+        for (size_t i = 0; i < count; ++i) {
+          const float g = gate[offset + i];
+          hidden[offset + i] = (g + (g * g * g) * 0.044715f) * kScale;
+        }
+      }
+      tanh_kernel(1, count, count * sizeof(float), hidden + offset, count * sizeof(float), hidden + offset,
+                  &tanh_params);
+      {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+        for (size_t i = 0; i < count; ++i) {
+          hidden[offset + i] = ((gate[offset + i] * 0.5f) * (1.0f + hidden[offset + i])) * up[offset + i];
+        }
+      }
+    }
+  }
+  return ynn_status_success;
 }
 
 }  // namespace ynn
