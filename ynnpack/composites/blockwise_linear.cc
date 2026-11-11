@@ -401,8 +401,8 @@ __attribute__((target("dotprod,fp16"))) void dispatch_i4_tiles(
 
 __attribute__((target("dotprod"))) void eval_i8_tile_32x1(
     size_t B, size_t block_size, const int8_t* p, const int8_t* qp,
-    const float* a_scale_base, float* y_base, size_t n_valid,
-    float output_scale) noexcept {
+    const float* a_scale_base, const float* a_zp_base, float* y_base,
+    size_t n_valid, float output_scale) noexcept {
   float32x4_t acc[8];
   for (auto& v : acc) v = vdupq_n_f32(0.0f);
   for (size_t b = 0; b < B; ++b) {
@@ -417,9 +417,15 @@ __attribute__((target("dotprod"))) void eval_i8_tile_32x1(
     }
     const auto* sp = reinterpret_cast<const float*>(p);
     p += 128;
+    const auto* wsp = reinterpret_cast<const int32_t*>(p);
+    p += 128;
+    const int32_t zp =
+        a_zp_base != nullptr ? static_cast<int32_t>(a_zp_base[b]) : 0;
     const float a_s = a_scale_base[b];
     for (size_t j = 0; j < 8; ++j) {
-      acc[j] = vfmaq_f32(acc[j], vcvtq_f32_s32(d[j]),
+      const int32x4_t corr =
+          zp != 0 ? vmlsq_n_s32(d[j], vld1q_s32(wsp + j * 4), zp) : d[j];
+      acc[j] = vfmaq_f32(acc[j], vcvtq_f32_s32(corr),
                          vmulq_n_f32(vld1q_f32(sp + j * 4), a_s));
     }
   }
@@ -429,8 +435,8 @@ __attribute__((target("dotprod"))) void eval_i8_tile_32x1(
 __attribute__((target("dotprod"))) void dispatch_i8_tiles(
     size_t M, size_t N, size_t B, size_t block_size, float output_scale,
     const int8_t* packed_ptr, const int8_t* act_q, const float* act_scale,
-    float* y, size_t t_begin, size_t t_end) noexcept {
-  const size_t block_bytes = block_size * 32 + 128;
+    const float* act_zp, float* y, size_t t_begin, size_t t_end) noexcept {
+  const size_t block_bytes = block_size * 32 + 256;
   const size_t tile_bytes = B * block_bytes;
 
   for (size_t tile = t_begin; tile < t_end; ++tile) {
@@ -439,8 +445,8 @@ __attribute__((target("dotprod"))) void dispatch_i8_tiles(
     const int8_t* tile_ptr = packed_ptr + tile * tile_bytes;
 
     if (M == 1) {
-      eval_i8_tile_32x1(B, block_size, tile_ptr, act_q, act_scale, y + n0,
-                        n_valid, output_scale);
+      eval_i8_tile_32x1(B, block_size, tile_ptr, act_q, act_scale, act_zp,
+                        y + n0, n_valid, output_scale);
       continue;
     }
 
@@ -498,14 +504,25 @@ __attribute__((target("dotprod"))) void dispatch_i8_tiles(
         }
         const auto* sp =
             reinterpret_cast<const float*>(p_block + block_size * 32);
+        const auto* wsp =
+            reinterpret_cast<const int32_t*>(p_block + block_size * 32 + 128);
         float32x4_t ws[8];
-        for (size_t j = 0; j < 8; ++j) ws[j] = vld1q_f32(sp + j * 4);
+        int32x4_t wsum[8];
+        for (size_t j = 0; j < 8; ++j) {
+          ws[j] = vld1q_f32(sp + j * 4);
+          wsum[j] = vld1q_s32(wsp + j * 4);
+        }
         for (size_t m = 0; m < m_count; ++m) {
           const float as = act_scale[(m0 + m) * B + b];
+          const int32_t zp =
+              act_zp != nullptr ? static_cast<int32_t>(act_zp[(m0 + m) * B + b])
+                                : 0;
           for (size_t j = 0; j < 8; ++j) {
             float32x4_t a = vld1q_f32(acc_buf[m] + j * 4);
-            a = vfmaq_f32(a, vcvtq_f32_s32(vld1q_s32(d_buf[m] + j * 4)),
-                          vmulq_n_f32(ws[j], as));
+            const int32x4_t raw_d = vld1q_s32(d_buf[m] + j * 4);
+            const int32x4_t corr =
+                zp != 0 ? vmlsq_n_s32(raw_d, wsum[j], zp) : raw_d;
+            a = vfmaq_f32(a, vcvtq_f32_s32(corr), vmulq_n_f32(ws[j], as));
             vst1q_f32(acc_buf[m] + j * 4, a);
           }
         }
@@ -551,7 +568,7 @@ size_t packed_blockwise_linear_size(int32_t bits, size_t n, size_t k,
     return tiles * B * block_bytes;
   }
   if (bits == 8) {
-    const size_t block_bytes = block_size * 32 + 128;
+    const size_t block_bytes = block_size * 32 + 256;
     return tiles * B * block_bytes;
   }
   return 0;
@@ -629,7 +646,7 @@ void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k,
   }
 
   if (bits == 8) {
-    const size_t block_bytes = block_size * 32 + 128;
+    const size_t block_bytes = block_size * 32 + 256;
     const size_t tile_bytes = B * block_bytes;
     const auto* w_all = static_cast<const int8_t*>(weights);
     for (size_t tile = tile_start; tile < tile_end; ++tile) {
@@ -637,13 +654,18 @@ void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k,
       uint8_t* dst = dst_all + tile * tile_bytes;
       for (size_t b = 0; b < B; ++b) {
         const size_t col_base = b * block_size;
+        int32_t wsum[32] = {};
         for (size_t k_idx = 0; k_idx < block_size; k_idx += 4) {
           for (size_t r = 0; r < 32; ++r) {
             const size_t row = n0 + r;
             int32_t word = 0;
-            if (row < n)
-              std::memcpy(&word, w_all + row * k + col_base + k_idx,
-                          sizeof(int32_t));
+            if (row < n) {
+              const int8_t* wp = w_all + row * k + col_base + k_idx;
+              std::memcpy(&word, wp, sizeof(int32_t));
+              wsum[r] +=
+                  static_cast<int32_t>(wp[0]) + static_cast<int32_t>(wp[1]) +
+                  static_cast<int32_t>(wp[2]) + static_cast<int32_t>(wp[3]);
+            }
             std::memcpy(dst + r * 4, &word, sizeof(int32_t));
           }
           dst += 128;
@@ -656,6 +678,8 @@ void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k,
                                             : s_f32[idx])
                              : 0.0f;
         }
+        dst += 128;
+        std::memcpy(dst, wsum, 32 * sizeof(int32_t));
         dst += 128;
       }
     }
@@ -756,6 +780,67 @@ void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k,
     for (size_t row = row_start; row < row_end; ++row) {
       for (size_t b = 0; b < B; ++b) {
         const float* x_block = input + (row * B + b) * block_size;
+        if (compute_bsum && input_bsums != nullptr) {
+          float32x4_t vmin0 = vdupq_n_f32(0.0f), vmin1 = vdupq_n_f32(0.0f);
+          float32x4_t vmax0 = vdupq_n_f32(0.0f), vmax1 = vdupq_n_f32(0.0f);
+          size_t c = 0;
+          for (; c + 32 <= block_size; c += 32) {
+            const float* xp = x_block + c;
+            const float32x4_t x0 = vld1q_f32(xp + 0), x1 = vld1q_f32(xp + 4);
+            const float32x4_t x2 = vld1q_f32(xp + 8), x3 = vld1q_f32(xp + 12);
+            const float32x4_t x4 = vld1q_f32(xp + 16), x5 = vld1q_f32(xp + 20);
+            const float32x4_t x6 = vld1q_f32(xp + 24), x7 = vld1q_f32(xp + 28);
+            vmin0 = vminq_f32(vmin0,
+                              vminq_f32(vminq_f32(x0, x1), vminq_f32(x2, x3)));
+            vmin1 = vminq_f32(vmin1,
+                              vminq_f32(vminq_f32(x4, x5), vminq_f32(x6, x7)));
+            vmax0 = vmaxq_f32(vmax0,
+                              vmaxq_f32(vmaxq_f32(x0, x1), vmaxq_f32(x2, x3)));
+            vmax1 = vmaxq_f32(vmax1,
+                              vmaxq_f32(vmaxq_f32(x4, x5), vmaxq_f32(x6, x7)));
+          }
+          for (; c < block_size; c += 16) {
+            const float* xp = x_block + c;
+            const float32x4_t x0 = vld1q_f32(xp + 0), x1 = vld1q_f32(xp + 4);
+            const float32x4_t x2 = vld1q_f32(xp + 8), x3 = vld1q_f32(xp + 12);
+            vmin0 = vminq_f32(vmin0,
+                              vminq_f32(vminq_f32(x0, x1), vminq_f32(x2, x3)));
+            vmax0 = vmaxq_f32(vmax0,
+                              vmaxq_f32(vmaxq_f32(x0, x1), vmaxq_f32(x2, x3)));
+          }
+          const float rmin = vminvq_f32(vminq_f32(vmin0, vmin1));
+          const float rmax = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
+          const float rdiff = rmax - rmin;
+          float scale = 1.0f;
+          float inv_scale = 0.0f;
+          int32_t zp = -128;
+          if (rdiff > 0.0f) {
+            inv_scale = 255.0f / rdiff;
+            scale = rdiff / 255.0f;
+            const float fzp = std::clamp(-rmin * inv_scale, 0.0f, 255.0f);
+            zp = static_cast<int32_t>(fzp + 0.5f) - 128;
+          }
+          input_scales[row * B + b] = scale;
+          input_bsums[row * B + b] = static_cast<float>(zp);
+          const float32x4_t vinv = vdupq_n_f32(inv_scale);
+          const int32x4_t vzp = vdupq_n_s32(zp);
+          int8_t* qp = quantized_input + (row * B + b) * block_size;
+          for (size_t col = 0; col < block_size; col += 16) {
+            const float* xp = x_block + col;
+            const int32x4_t i0 = vaddq_s32(
+                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 0), vinv)), vzp);
+            const int32x4_t i1 = vaddq_s32(
+                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 4), vinv)), vzp);
+            const int32x4_t i2 = vaddq_s32(
+                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 8), vinv)), vzp);
+            const int32x4_t i3 = vaddq_s32(
+                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 12), vinv)), vzp);
+            const int16x8_t s0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+            const int16x8_t s1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+            vst1q_s8(qp + col, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
+          }
+          continue;
+        }
         float32x4_t vmax0 = vdupq_n_f32(0.0f), vmax1 = vdupq_n_f32(0.0f);
         size_t c = 0;
         for (; c + 32 <= block_size; c += 32) {
@@ -876,7 +961,7 @@ void blockwise_linear_f32(int32_t bits, size_t m, size_t n, size_t k,
   if (bits == 8) {
     const auto* ptr = static_cast<const int8_t*>(packed_tiles);
     dispatch_i8_tiles(m, n, B, block_size, output_scale, ptr, quantized_input,
-                      input_scales, output, tile_start, tile_end);
+                      input_scales, input_bsums, output, tile_start, tile_end);
   }
 #else
   (void)bits;

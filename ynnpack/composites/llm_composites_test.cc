@@ -265,19 +265,22 @@ TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
         for (size_t M : {size_t{1}, size_t{35}}) {
           std::vector<float> x(M * K);
           for (size_t i = 0; i < x.size(); ++i) {
-            x[i] = 0.1f * static_cast<float>(static_cast<int>(i % 19) - 9);
+            // Skewed positive range [-0.2, 3.4] exercises qd8 asymmetric
+            // activation zero-point correction for bits == 8.
+            x[i] = 0.2f * static_cast<float>(static_cast<int>(i % 19) - 1);
           }
+          const bool use_bsum = has_zero || bits == 8;
           std::vector<int8_t> act_q(M * K);
           std::vector<float> act_s(M * B);
-          std::vector<float> act_b(has_zero ? M * B : 0);
+          std::vector<float> act_b(use_bsum ? M * B : 0);
           quantize_blockwise_activations_f32(
-              bits, M, K, block_size, has_zero, x.data(), act_q.data(),
-              act_s.data(), has_zero ? act_b.data() : nullptr, 0, M);
+              bits, M, K, block_size, use_bsum, x.data(), act_q.data(),
+              act_s.data(), use_bsum ? act_b.data() : nullptr, 0, M);
           std::vector<float> y(M * N, 0.0f);
           blockwise_linear_f32(
               bits, M, N, K, block_size, has_zero, /*output_scale=*/0.0f,
               tiles_buf.data(), act_q.data(), act_s.data(),
-              has_zero ? act_b.data() : nullptr, y.data(), 0, tiles);
+              use_bsum ? act_b.data() : nullptr, y.data(), 0, tiles);
 
           // Compare against float reference using quantized activations +
           // FP16/FP32 scales.
@@ -285,21 +288,45 @@ TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
             for (size_t n = 0; n < N; ++n) {
               float ref = 0.0f;
               for (size_t b = 0; b < B; ++b) {
-                float amax = 0.0f;
-                float bsum = 0.0f;
+                float rmin = 0.0f, rmax = 0.0f, amax = 0.0f, bsum = 0.0f;
                 for (size_t k = 0; k < block_size; ++k) {
                   const float xv = x[(m * B + b) * block_size + k];
+                  rmin = std::min(rmin, xv);
+                  rmax = std::max(rmax, xv);
                   amax = std::max(amax, std::abs(xv));
                   bsum += xv;
                 }
-                const float a_scale = amax / 127.0f;
-                const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+                float a_scale = 0.0f;
                 int32_t dot = 0;
-                for (size_t k = 0; k < block_size; ++k) {
-                  const int32_t qv = static_cast<int32_t>(
-                      std::nearbyint(x[(m * B + b) * block_size + k] * inv));
-                  dot += qv * static_cast<int32_t>(
-                                  w_unpacked[n * K + b * block_size + k]);
+                if (bits == 8) {
+                  const float rdiff = rmax - rmin;
+                  const float inv = rdiff > 0.0f ? 255.0f / rdiff : 0.0f;
+                  a_scale = rdiff > 0.0f ? rdiff / 255.0f : 1.0f;
+                  const int32_t zp =
+                      rdiff > 0.0f
+                          ? static_cast<int32_t>(
+                                std::clamp(-rmin * inv, 0.0f, 255.0f) + 0.5f) -
+                                128
+                          : -128;
+                  for (size_t k = 0; k < block_size; ++k) {
+                    const int32_t qv = std::clamp<int32_t>(
+                        static_cast<int32_t>(std::nearbyint(
+                            x[(m * B + b) * block_size + k] * inv)) +
+                            zp,
+                        -128, 127);
+                    dot +=
+                        (qv - zp) * static_cast<int32_t>(
+                                        w_unpacked[n * K + b * block_size + k]);
+                  }
+                } else {
+                  a_scale = amax / 127.0f;
+                  const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+                  for (size_t k = 0; k < block_size; ++k) {
+                    const int32_t qv = static_cast<int32_t>(
+                        std::nearbyint(x[(m * B + b) * block_size + k] * inv));
+                    dot += qv * static_cast<int32_t>(
+                                    w_unpacked[n * K + b * block_size + k]);
+                  }
                 }
                 const float ws =
                     bits == 4 ? static_cast<float>(half(scales[n * B + b]))
