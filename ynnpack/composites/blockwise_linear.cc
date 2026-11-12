@@ -817,8 +817,13 @@ void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k,
           if (rdiff > 0.0f) {
             inv_scale = 255.0f / rdiff;
             scale = rdiff / 255.0f;
-            const float fzp = std::clamp(-rmin * inv_scale, 0.0f, 255.0f);
-            zp = static_cast<int32_t>(fzp + 0.5f) - 128;
+            const float min_error = -128.0f + rmin * inv_scale;
+            const float max_error = 127.0f + rmax * inv_scale;
+            const float fzp = min_error + max_error > 0.0f
+                                  ? -128.0f - rmin * inv_scale
+                                  : 127.0f - rmax * inv_scale;
+            zp = static_cast<int32_t>(
+                std::rint(std::clamp(fzp, -128.0f, 127.0f)));
           }
           input_scales[row * B + b] = scale;
           input_bsums[row * B + b] = static_cast<float>(zp);
@@ -828,13 +833,13 @@ void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k,
           for (size_t col = 0; col < block_size; col += 16) {
             const float* xp = x_block + col;
             const int32x4_t i0 = vaddq_s32(
-                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 0), vinv)), vzp);
+                vcvtaq_s32_f32(vmulq_f32(vld1q_f32(xp + 0), vinv)), vzp);
             const int32x4_t i1 = vaddq_s32(
-                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 4), vinv)), vzp);
+                vcvtaq_s32_f32(vmulq_f32(vld1q_f32(xp + 4), vinv)), vzp);
             const int32x4_t i2 = vaddq_s32(
-                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 8), vinv)), vzp);
+                vcvtaq_s32_f32(vmulq_f32(vld1q_f32(xp + 8), vinv)), vzp);
             const int32x4_t i3 = vaddq_s32(
-                vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 12), vinv)), vzp);
+                vcvtaq_s32_f32(vmulq_f32(vld1q_f32(xp + 12), vinv)), vzp);
             const int16x8_t s0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
             const int16x8_t s1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
             vst1q_s8(qp + col, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
