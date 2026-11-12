@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "ynnpack/composites/hnsw.h"
 #include "ynnpack/include/ynnpack.h"
 
 namespace ynn {

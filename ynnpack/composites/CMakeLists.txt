@@ -12,6 +12,8 @@ ADD_LIBRARY(ynnpack_composites STATIC
   elementwise.cc
   embedding.cc
   feed_forward.cc
+  hnsw.cc
+  hnsw_kernels.cc
   normalization.cc
   pooling.cc
   reduction.cc
@@ -34,4 +36,13 @@ IF(YNNPACK_BUILD_TESTS)
     gtest_main
   )
   ADD_TEST(NAME ynnpack_composites_llm_test COMMAND ynnpack_composites_llm_test)
+
+  ADD_EXECUTABLE(ynnpack_composites_hnsw_test hnsw_test.cc)
+  TARGET_LINK_LIBRARIES(ynnpack_composites_hnsw_test
+    ynnpack_composites
+    slinky_thread_pool_impl
+    gtest
+    gtest_main
+  )
+  ADD_TEST(NAME ynnpack_composites_hnsw_test COMMAND ynnpack_composites_hnsw_test)
 ENDIF()
