@@ -282,17 +282,47 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
 namespace {
 
 float dot_f32_lanes8(const float* left, const float* right, size_t count) {
-    float lanes[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     size_t index = 0;
+#if defined(__ARM_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    for (; index + 8 <= count; index += 8) {
+        acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(left + index), vld1q_f32(right + index)));
+        acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(left + index + 4), vld1q_f32(right + index + 4)));
+    }
+    float lanes[8];
+    vst1q_f32(lanes, acc0);
+    vst1q_f32(lanes + 4, acc1);
+#else
+    float lanes[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (; index + 8 <= count; index += 8) {
         for (size_t lane = 0; lane < 8; ++lane) {
             lanes[lane] += left[index + lane] * right[index + lane];
         }
     }
+#endif
     float sum = 0.0f;
     for (size_t lane = 0; lane < 8; ++lane) sum += lanes[lane];
     for (; index < count; ++index) sum += left[index] * right[index];
     return sum;
+}
+
+inline void accumulate_weighted_f32(float* dst, const float* src, float weight, size_t count) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    size_t index = 0;
+#if defined(__ARM_NEON)
+    const float32x4_t vw = vdupq_n_f32(weight);
+    for (; index + 8 <= count; index += 8) {
+        vst1q_f32(dst + index, vaddq_f32(vld1q_f32(dst + index), vmulq_f32(vld1q_f32(src + index), vw)));
+        vst1q_f32(dst + index + 4, vaddq_f32(vld1q_f32(dst + index + 4), vmulq_f32(vld1q_f32(src + index + 4), vw)));
+    }
+#endif
+    for (; index < count; ++index) dst[index] += weight * src[index];
 }
 
 bool is_single_gqa8_step(const attention_f32_params& params) {
@@ -303,13 +333,13 @@ bool is_single_gqa8_step(const attention_f32_params& params) {
 } // namespace
 
 size_t attention_f32_work_items(const attention_f32_params& params) {
-    if (is_single_gqa8_step(params)) return 1;
+    if (is_single_gqa8_step(params)) return 4;
     return params.batch_size * params.query_length * params.query_heads;
 }
 
 size_t attention_f32_scratch_size(const attention_f32_params& params) {
     const size_t keys = params.key_length ? params.key_length : params.total_keys;
-    return (is_single_gqa8_step(params) ? 8 : 1) * keys;
+    return (is_single_gqa8_step(params) ? 2 : 1) * keys;
 }
 
 void attention_f32(const attention_f32_params& params, const float* query, const float* key_data,
@@ -328,54 +358,64 @@ void attention_f32(const attention_f32_params& params, const float* query, const
     const size_t keys = params.key_length ? params.key_length : params.total_keys;
 
     if (is_single_gqa8_step(params)) {
-        if (item_start > 0 || item_end == 0) return;
+        item_end = std::min<size_t>(item_end, 4);
+        if (item_start >= item_end) return;
         const float* k_base = key_data + params.key_start * head_width;
         const float* v_base = value_data + params.key_start * head_width;
         size_t active_keys = keys;
         if (mask != nullptr) {
             while (active_keys > 0 && mask[(active_keys - 1) * params.mask_key_stride] <= -1e8f) --active_keys;
         }
-        if (active_keys == 0) {
-            std::fill_n(output_data, width, 0.0f);
-            return;
-        }
-        float largest[8];
-        std::fill_n(largest, 8, -std::numeric_limits<float>::infinity());
-        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
-            const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
-            if (b <= -1e8f) {
-                for (size_t h = 0; h < 8; ++h) {
-                    scratch[h * active_keys + k_idx] = -std::numeric_limits<float>::infinity();
-                }
+        for (size_t item = item_start; item < item_end; ++item) {
+            const size_t h_begin = item * 2;
+            if (active_keys == 0) {
+                std::fill_n(output_data + h_begin * head_width, 2 * head_width, 0.0f);
                 continue;
             }
-            const float* k_row = k_base + k_idx * head_width;
-            for (size_t h = 0; h < 8; ++h) {
-                const float s = dot_f32_lanes8(query + h * head_width, k_row, head_width) * params.scale + b;
-                scratch[h * active_keys + k_idx] = s;
-                largest[h] = std::max(largest[h], s);
-            }
-        }
-        float inv_total[8];
-        for (size_t h = 0; h < 8; ++h) {
-            float total = 0.0f;
-            float* scores = scratch + h * active_keys;
+            float largest0 = -std::numeric_limits<float>::infinity();
+            float largest1 = -std::numeric_limits<float>::infinity();
+            float* scores0 = scratch;
+            float* scores1 = scratch + active_keys;
+            const float* q0 = query + h_begin * head_width;
+            const float* q1 = q0 + head_width;
             for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
-                scores[k_idx] =
-                    scores[k_idx] == -std::numeric_limits<float>::infinity() ? 0.0f : std::exp(scores[k_idx] - largest[h]);
-                total += scores[k_idx];
+                const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+                if (b <= -1e8f) {
+                    scores0[k_idx] = -std::numeric_limits<float>::infinity();
+                    scores1[k_idx] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                const float* k_row = k_base + k_idx * head_width;
+                const float s0 = dot_f32_lanes8(q0, k_row, head_width) * params.scale + b;
+                const float s1 = dot_f32_lanes8(q1, k_row, head_width) * params.scale + b;
+                scores0[k_idx] = s0;
+                scores1[k_idx] = s1;
+                largest0 = std::max(largest0, s0);
+                largest1 = std::max(largest1, s1);
             }
-            inv_total[h] = 1.0f / total;
-        }
-        std::fill_n(output_data, width, 0.0f);
-        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
-            const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
-            if (b <= -1e8f) continue;
-            const float* v_row = v_base + k_idx * head_width;
-            for (size_t h = 0; h < 8; ++h) {
-                const float w = scratch[h * active_keys + k_idx] * inv_total[h];
-                float* out_h = output_data + h * head_width;
-                for (size_t index = 0; index < head_width; ++index) out_h[index] += w * v_row[index];
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                scores0[k_idx] = scores0[k_idx] == -std::numeric_limits<float>::infinity()
+                                     ? 0.0f
+                                     : std::exp(scores0[k_idx] - largest0);
+                scores1[k_idx] = scores1[k_idx] == -std::numeric_limits<float>::infinity()
+                                     ? 0.0f
+                                     : std::exp(scores1[k_idx] - largest1);
+                total0 += scores0[k_idx];
+                total1 += scores1[k_idx];
+            }
+            const float inv_total0 = 1.0f / total0;
+            const float inv_total1 = 1.0f / total1;
+            float* out0 = output_data + h_begin * head_width;
+            float* out1 = out0 + head_width;
+            std::fill_n(out0, 2 * head_width, 0.0f);
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+                if (b <= -1e8f) continue;
+                const float* v_row = v_base + k_idx * head_width;
+                accumulate_weighted_f32(out0, v_row, scores0[k_idx] * inv_total0, head_width);
+                accumulate_weighted_f32(out1, v_row, scores1[k_idx] * inv_total1, head_width);
             }
         }
         return;
@@ -394,8 +434,16 @@ void attention_f32(const attention_f32_params& params, const float* query, const
         const float* bias = mask != nullptr ? mask + sample * params.mask_batch_stride + head * params.mask_head_stride +
                                                   row * params.mask_query_stride
                                             : nullptr;
+        size_t active_keys = keys;
+        if (bias != nullptr) {
+            while (active_keys > 0 && bias[(active_keys - 1) * params.mask_key_stride] <= -1e8f) --active_keys;
+        }
+        if (active_keys == 0) {
+            std::fill_n(output_data + (sample * rows + row) * width + head * head_width, head_width, 0.0f);
+            continue;
+        }
         float largest = -std::numeric_limits<float>::infinity();
-        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
             const float b = bias != nullptr ? bias[k_idx * params.mask_key_stride] : 0.0f;
             if (b <= -1e8f) {
                 scratch[k_idx] = -std::numeric_limits<float>::infinity();
@@ -405,7 +453,7 @@ void attention_f32(const attention_f32_params& params, const float* query, const
             largest = std::max(largest, scratch[k_idx]);
         }
         float total = 0.0f;
-        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
             scratch[k_idx] =
                 scratch[k_idx] == -std::numeric_limits<float>::infinity() ? 0.0f : std::exp(scratch[k_idx] - largest);
             total += scratch[k_idx];
@@ -413,11 +461,10 @@ void attention_f32(const attention_f32_params& params, const float* query, const
         const float inv_total = 1.0f / total;
         float* out = output_data + (sample * rows + row) * width + head * head_width;
         std::fill_n(out, head_width, 0.0f);
-        for (size_t k_idx = 0; k_idx < keys; ++k_idx) {
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
             if (scratch[k_idx] == 0.0f) continue;
             const float weight = scratch[k_idx] * inv_total;
-            const float* source = v + k_idx * kv_width;
-            for (size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
+            accumulate_weighted_f32(out, v + k_idx * kv_width, weight, head_width);
         }
     }
 }

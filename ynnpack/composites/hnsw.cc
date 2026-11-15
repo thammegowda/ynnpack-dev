@@ -72,7 +72,7 @@ inline void graph_neighbors(const hnsw_graph& graph, uint32_t node,
 hnsw_parallel_for_fn make_threadpool_parallel_for(ynn_threadpool_t threadpool) {
   if (threadpool == nullptr) return {};
   auto* pool = reinterpret_cast<slinky::thread_pool*>(threadpool);
-  if (pool->thread_count() <= 1) return {};
+  if (pool->thread_count() <= 0) return {};
   return [pool](size_t task_count, std::function<void(size_t)> body) -> bool {
     pool->parallel_for(task_count, [&body](size_t idx) { body(idx); });
     return true;
@@ -779,232 +779,221 @@ ynn_status prepare_hnsw_quantized_search(
   return ynn_status_success;
 }
 
-ynn_status search_hnsw(const hnsw_search_index& index, const float* query,
-                       size_t query_width, size_t k, size_t ef,
-                       hnsw_workspace* workspace,
-                       const hnsw_neighbor** out_neighbors, size_t* out_count,
-                       hnsw_parallel_for_fn parallel_for) {
-  const hnsw_graph& graph = index.graph;
-  const size_t nodes = graph.labels.size();
-  if (query == nullptr || workspace == nullptr || out_neighbors == nullptr ||
-      out_count == nullptr || nodes == 0 || query_width != graph.width ||
-      k == 0 || k > nodes || ef < k) {
-    return ynn_status_invalid_parameter;
-  }
-  for (size_t i = 0; i < query_width; ++i) {
-    if (!std::isfinite(query[i])) return ynn_status_invalid_parameter;
-  }
+namespace {
 
-  if (index.bits != 0) {
-    hnsw_prepare_quantized_query(query, graph.width, index.bits,
-                                 index.group_size, index.input_scale,
-                                 workspace->q_i8, workspace->q_scale,
-                                 workspace->q_bsum);
-  }
-  ef = std::min(ef, nodes);
-  const size_t visited_words = (nodes + 63u) / 64u;
-  workspace->visited.assign(visited_words, 0);
-  ++workspace->epoch;
-  workspace->frontier.reserve(ef * 2 + 1);
-  workspace->nearest.reserve(ef + 1);
-  workspace->unseen.reserve(256);
-  workspace->unseen_distances.reserve(256);
-  workspace->frontier.clear();
-  workspace->nearest.clear();
-  workspace->result.clear();
-  workspace->result.reserve(k);
-
-  std::atomic<bool> nonfinite{false};
-  const auto slice_ptr = [&](uint32_t node) noexcept -> const uint8_t* {
-    return index.packed_rows.data() +
-           static_cast<size_t>(node) * index.slice_bytes;
-  };
-  const auto single_distance = [&](uint32_t node) noexcept -> float {
-    const uint8_t* slice = slice_ptr(node);
-    const float score =
-        index.bits == 0
-            ? index.kernels.dot(query, slice, graph.width)
-            : hnsw_quantized_slice_dot(
-                  slice, graph.width, index.bits, index.group_size,
-                  index.scale_fp16, index.zero_fp16, index.has_zero,
-                  workspace->q_i8.data(), workspace->q_scale.data(),
-                  workspace->q_bsum.data());
-    const float d = 1.0f - score;
-    if (!std::isfinite(d)) {
-      nonfinite.store(true, std::memory_order_relaxed);
-      return 0.0f;
+template <typename ScoreBatchParallel>
+ynn_status search_hnsw_impl(const hnsw_search_index& index, const float* query, size_t query_width, size_t k, size_t ef,
+                            hnsw_workspace* workspace, const hnsw_neighbor** out_neighbors, size_t* out_count,
+                            bool has_parallel, ScoreBatchParallel&& run_parallel_batch) {
+    const hnsw_graph& graph = index.graph;
+    const size_t nodes = graph.labels.size();
+    if (query == nullptr || workspace == nullptr || out_neighbors == nullptr || out_count == nullptr || nodes == 0 ||
+        query_width != graph.width || k == 0 || k > nodes || ef < k) {
+        return ynn_status_invalid_parameter;
     }
-    return d;
-  };
-  const auto score_range = [&](const uint32_t* batch, float* distances,
-                               size_t begin, size_t end) noexcept {
-    size_t idx = begin;
-    for (; idx + 4 <= end; idx += 4) {
-      if (idx + 8 <= end) {
-        hnsw_prefetch_slice(slice_ptr(batch[idx + 4]), index.slice_bytes);
-        hnsw_prefetch_slice(slice_ptr(batch[idx + 5]), index.slice_bytes);
-        hnsw_prefetch_slice(slice_ptr(batch[idx + 6]), index.slice_bytes);
-        hnsw_prefetch_slice(slice_ptr(batch[idx + 7]), index.slice_bytes);
-      }
-      const uint8_t* s0 = slice_ptr(batch[idx + 0]);
-      const uint8_t* s1 = slice_ptr(batch[idx + 1]);
-      const uint8_t* s2 = slice_ptr(batch[idx + 2]);
-      const uint8_t* s3 = slice_ptr(batch[idx + 3]);
-      float dots[4];
-      if (index.bits == 0) {
-        index.kernels.dot4(query, s0, s1, s2, s3, graph.width, dots);
-      } else {
-        hnsw_quantized_slices4_dot(
-            s0, s1, s2, s3, graph.width, index.bits, index.group_size,
-            index.scale_fp16, index.zero_fp16, index.has_zero,
-            workspace->q_i8.data(), workspace->q_scale.data(),
-            workspace->q_bsum.data(), dots);
-      }
-      for (size_t r = 0; r < 4; ++r) {
-        const float d = 1.0f - dots[r];
+    for (size_t i = 0; i < query_width; ++i) {
+        if (!std::isfinite(query[i])) return ynn_status_invalid_parameter;
+    }
+
+    if (index.bits != 0) {
+        hnsw_prepare_quantized_query(query, graph.width, index.bits, index.group_size, index.input_scale,
+                                     workspace->q_i8, workspace->q_scale, workspace->q_bsum);
+    }
+    ef = std::min(ef, nodes);
+    const size_t visited_words = (nodes + 63u) / 64u;
+    workspace->visited.assign(visited_words, 0);
+    ++workspace->epoch;
+    workspace->frontier.reserve(ef * 2 + 1);
+    workspace->nearest.reserve(ef + 1);
+    workspace->unseen.reserve(256);
+    workspace->unseen_distances.reserve(256);
+    workspace->frontier.clear();
+    workspace->nearest.clear();
+    workspace->result.clear();
+    workspace->result.reserve(k);
+
+    std::atomic<bool> nonfinite{false};
+    const auto slice_ptr = [&](uint32_t node) noexcept -> const uint8_t* {
+        return index.packed_rows.data() + static_cast<size_t>(node) * index.slice_bytes;
+    };
+    const auto single_distance = [&](uint32_t node) noexcept -> float {
+        const uint8_t* slice = slice_ptr(node);
+        const float score = index.bits == 0 ? index.kernels.dot(query, slice, graph.width)
+                                            : hnsw_quantized_slice_dot(
+                                                  slice, graph.width, index.bits, index.group_size, index.scale_fp16,
+                                                  index.zero_fp16, index.has_zero, workspace->q_i8.data(),
+                                                  workspace->q_scale.data(), workspace->q_bsum.data());
+        const float d = 1.0f - score;
         if (!std::isfinite(d)) {
-          nonfinite.store(true, std::memory_order_relaxed);
-          distances[idx + r] = 0.0f;
-        } else {
-          distances[idx + r] = d;
+            nonfinite.store(true, std::memory_order_relaxed);
+            return 0.0f;
         }
-      }
-    }
-    for (; idx < end; ++idx) distances[idx] = single_distance(batch[idx]);
-  };
-  const auto score_batch = [&](const uint32_t* batch, size_t count,
-                               float* distances) -> bool {
-    if (parallel_for && count >= 48) {
-      const size_t chunk = std::max<size_t>(16, ((count / 4) + 3u) & ~size_t{3});
-      const size_t tasks = (count + chunk - 1) / chunk;
-      if (tasks >= 2) {
-        if (!parallel_for(tasks, [&](size_t task) {
-              const size_t begin = task * chunk;
-              if (begin >= count || nonfinite.load(std::memory_order_relaxed)) {
-                return;
-              }
-              score_range(batch, distances, begin, std::min(count, begin + chunk));
-            })) {
-          return false;
+        return d;
+    };
+    const auto score_range = [&](const uint32_t* batch, float* distances, size_t begin, size_t end) noexcept {
+        size_t idx = begin;
+        for (; idx + 4 <= end; idx += 4) {
+            if (idx + 8 <= end) {
+                hnsw_prefetch_slice(slice_ptr(batch[idx + 4]), index.slice_bytes);
+                hnsw_prefetch_slice(slice_ptr(batch[idx + 5]), index.slice_bytes);
+                hnsw_prefetch_slice(slice_ptr(batch[idx + 6]), index.slice_bytes);
+                hnsw_prefetch_slice(slice_ptr(batch[idx + 7]), index.slice_bytes);
+            }
+            const uint8_t* s0 = slice_ptr(batch[idx + 0]);
+            const uint8_t* s1 = slice_ptr(batch[idx + 1]);
+            const uint8_t* s2 = slice_ptr(batch[idx + 2]);
+            const uint8_t* s3 = slice_ptr(batch[idx + 3]);
+            float dots[4];
+            if (index.bits == 0) {
+                index.kernels.dot4(query, s0, s1, s2, s3, graph.width, dots);
+            } else {
+                hnsw_quantized_slices4_dot(s0, s1, s2, s3, graph.width, index.bits, index.group_size, index.scale_fp16,
+                                           index.zero_fp16, index.has_zero, workspace->q_i8.data(),
+                                           workspace->q_scale.data(), workspace->q_bsum.data(), dots);
+            }
+            for (size_t r = 0; r < 4; ++r) {
+                const float d = 1.0f - dots[r];
+                if (!std::isfinite(d)) {
+                    nonfinite.store(true, std::memory_order_relaxed);
+                    distances[idx + r] = 0.0f;
+                } else {
+                    distances[idx + r] = d;
+                }
+            }
         }
+        for (; idx < end; ++idx) distances[idx] = single_distance(batch[idx]);
+    };
+    const auto score_batch = [&](const uint32_t* batch, size_t count, float* distances) -> bool {
+        if (has_parallel && count >= 48) {
+            const size_t chunk = std::max<size_t>(16, ((count / 4) + 3u) & ~size_t{3});
+            const size_t tasks = (count + chunk - 1) / chunk;
+            if (tasks >= 2) {
+                if (!run_parallel_batch(tasks, [&](size_t task) {
+                        const size_t begin = task * chunk;
+                        if (begin >= count || nonfinite.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                        score_range(batch, distances, begin, std::min(count, begin + chunk));
+                    })) {
+                    return false;
+                }
+                return !nonfinite.load(std::memory_order_relaxed);
+            }
+        }
+        score_range(batch, distances, 0, count);
         return !nonfinite.load(std::memory_order_relaxed);
-      }
-    }
-    score_range(batch, distances, 0, count);
-    return !nonfinite.load(std::memory_order_relaxed);
-  };
+    };
 
-  uint32_t entry = graph.entry;
-  float best_entry = single_distance(entry);
-  if (nonfinite.load(std::memory_order_relaxed)) return ynn_status_error;
-  for (size_t level = graph.upper.size(); level != 0; --level) {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      const uint32_t* neighbors = nullptr;
-      size_t count = 0;
-      graph_neighbors(graph, entry, level, &neighbors, &count);
-      workspace->unseen_distances.resize(count);
-      score_range(neighbors, workspace->unseen_distances.data(), 0, count);
-      if (nonfinite.load(std::memory_order_relaxed)) return ynn_status_error;
-      for (size_t idx = 0; idx < count; ++idx) {
-        const float value = workspace->unseen_distances[idx];
-        if (value < best_entry) {
-          best_entry = value;
-          entry = neighbors[idx];
-          changed = true;
+    uint32_t entry = graph.entry;
+    float best_entry = single_distance(entry);
+    if (nonfinite.load(std::memory_order_relaxed)) return ynn_status_error;
+    for (size_t level = graph.upper.size(); level != 0; --level) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            const uint32_t* neighbors = nullptr;
+            size_t count = 0;
+            graph_neighbors(graph, entry, level, &neighbors, &count);
+            workspace->unseen_distances.resize(count);
+            score_range(neighbors, workspace->unseen_distances.data(), 0, count);
+            if (nonfinite.load(std::memory_order_relaxed)) return ynn_status_error;
+            for (size_t idx = 0; idx < count; ++idx) {
+                const float value = workspace->unseen_distances[idx];
+                if (value < best_entry) {
+                    best_entry = value;
+                    entry = neighbors[idx];
+                    changed = true;
+                }
+            }
         }
-      }
     }
-  }
 
-  heap_push(workspace->frontier, -best_entry, entry);
-  workspace->nearest.emplace_back(best_entry, entry);
-  workspace->visited[entry >> 6u] |= (uint64_t{1} << (entry & 63u));
-  bool nearest_heap = ef == 1;
-  float best =
-      nearest_heap ? best_entry : std::numeric_limits<float>::infinity();
-  while (!workspace->frontier.empty()) {
-    if (nearest_heap && -workspace->frontier.front().first > best) break;
-    workspace->unseen.clear();
-    const size_t max_pops = parallel_for ? (nearest_heap ? 2 : 4) : 1;
-    for (size_t pop_idx = 0;
-         pop_idx < max_pops && !workspace->frontier.empty(); ++pop_idx) {
-      if (nearest_heap && -workspace->frontier.front().first > best) break;
-      const uint32_t current = heap_pop(workspace->frontier).second;
-      const uint32_t* neighbors = nullptr;
-      size_t count = 0;
-      graph_neighbors(graph, current, 0, &neighbors, &count);
-      for (size_t i = 0; i < count; ++i) {
-        const uint32_t nb = neighbors[i];
-        const uint64_t mask = uint64_t{1} << (nb & 63u);
-        uint64_t& word = workspace->visited[nb >> 6u];
-        if ((word & mask) == 0) {
-          word |= mask;
-          workspace->unseen.push_back(nb);
+    heap_push(workspace->frontier, -best_entry, entry);
+    workspace->nearest.emplace_back(best_entry, entry);
+    workspace->visited[entry >> 6u] |= (uint64_t{1} << (entry & 63u));
+    bool nearest_heap = ef == 1;
+    float best = nearest_heap ? best_entry : std::numeric_limits<float>::infinity();
+    while (!workspace->frontier.empty()) {
+        if (nearest_heap && -workspace->frontier.front().first > best) break;
+        workspace->unseen.clear();
+        const size_t max_pops = has_parallel ? (nearest_heap ? 2 : 4) : 1;
+        for (size_t pop_idx = 0; pop_idx < max_pops && !workspace->frontier.empty(); ++pop_idx) {
+            if (nearest_heap && -workspace->frontier.front().first > best) break;
+            const uint32_t current = heap_pop(workspace->frontier).second;
+            const uint32_t* neighbors = nullptr;
+            size_t count = 0;
+            graph_neighbors(graph, current, 0, &neighbors, &count);
+            for (size_t i = 0; i < count; ++i) {
+                const uint32_t nb = neighbors[i];
+                const uint64_t mask = uint64_t{1} << (nb & 63u);
+                uint64_t& word = workspace->visited[nb >> 6u];
+                if ((word & mask) == 0) {
+                    word |= mask;
+                    workspace->unseen.push_back(nb);
+                }
+            }
+            if (nearest_heap && workspace->unseen.size() >= 48) break;
+            if (!nearest_heap && workspace->nearest.size() + workspace->unseen.size() >= ef) {
+                break;
+            }
         }
-      }
-      if (nearest_heap && workspace->unseen.size() >= 48) break;
-      if (!nearest_heap &&
-          workspace->nearest.size() + workspace->unseen.size() >= ef) {
-        break;
-      }
-    }
-    if (workspace->unseen.empty()) continue;
-    workspace->unseen_distances.resize(workspace->unseen.size());
-    if (!score_batch(workspace->unseen.data(), workspace->unseen.size(),
-                     workspace->unseen_distances.data())) {
-      return ynn_status_error;
-    }
-    for (size_t idx = 0; idx < workspace->unseen.size(); ++idx) {
-      const uint32_t nb = workspace->unseen[idx];
-      const float value = workspace->unseen_distances[idx];
-      if (!nearest_heap) {
-        workspace->nearest.emplace_back(value, nb);
-        if (workspace->nearest.size() == ef) {
-          std::make_heap(workspace->nearest.begin(), workspace->nearest.end(),
-                         ByDistance{});
-          nearest_heap = true;
-          best = workspace->nearest.front().first;
+        if (workspace->unseen.empty()) continue;
+        workspace->unseen_distances.resize(workspace->unseen.size());
+        if (!score_batch(workspace->unseen.data(), workspace->unseen.size(), workspace->unseen_distances.data())) {
+            return ynn_status_error;
         }
-        workspace->unseen_distances[idx] = value;
-      } else if (value < best) {
-        std::pop_heap(workspace->nearest.begin(), workspace->nearest.end(),
-                      ByDistance{});
-        workspace->nearest.back() = {value, nb};
-        std::push_heap(workspace->nearest.begin(), workspace->nearest.end(),
-                       ByDistance{});
-        best = workspace->nearest.front().first;
-      } else {
-        workspace->unseen_distances[idx] =
-            std::numeric_limits<float>::infinity();
-      }
+        for (size_t idx = 0; idx < workspace->unseen.size(); ++idx) {
+            const uint32_t nb = workspace->unseen[idx];
+            const float value = workspace->unseen_distances[idx];
+            if (!nearest_heap) {
+                workspace->nearest.emplace_back(value, nb);
+                if (workspace->nearest.size() == ef) {
+                    std::make_heap(workspace->nearest.begin(), workspace->nearest.end(), ByDistance{});
+                    nearest_heap = true;
+                    best = workspace->nearest.front().first;
+                }
+                workspace->unseen_distances[idx] = value;
+            } else if (value < best) {
+                std::pop_heap(workspace->nearest.begin(), workspace->nearest.end(), ByDistance{});
+                workspace->nearest.back() = {value, nb};
+                std::push_heap(workspace->nearest.begin(), workspace->nearest.end(), ByDistance{});
+                best = workspace->nearest.front().first;
+            } else {
+                workspace->unseen_distances[idx] = std::numeric_limits<float>::infinity();
+            }
+        }
+        for (size_t idx = 0; idx < workspace->unseen.size(); ++idx) {
+            const float value = workspace->unseen_distances[idx];
+            if (!nearest_heap || value <= best) {
+                heap_push(workspace->frontier, -value, workspace->unseen[idx]);
+            }
+        }
     }
-    for (size_t idx = 0; idx < workspace->unseen.size(); ++idx) {
-      const float value = workspace->unseen_distances[idx];
-      if (!nearest_heap || value <= best) {
-        heap_push(workspace->frontier, -value, workspace->unseen[idx]);
-      }
+    if (workspace->nearest.size() < k) return ynn_status_error;
+    std::partial_sort(workspace->nearest.begin(), workspace->nearest.begin() + static_cast<ptrdiff_t>(k),
+                      workspace->nearest.end(),
+                      [&](const std::pair<float, uint32_t>& left, const std::pair<float, uint32_t>& right) {
+                          return left.first < right.first ||
+                                 (left.first == right.first && graph.labels[left.second] < graph.labels[right.second]);
+                      });
+    for (size_t rank = 0; rank < k; ++rank) {
+        const auto& item = workspace->nearest[rank];
+        workspace->result.push_back({item.first, graph.labels[item.second]});
     }
-  }
-  if (workspace->nearest.size() < k) return ynn_status_error;
-  std::partial_sort(
-      workspace->nearest.begin(),
-      workspace->nearest.begin() + static_cast<ptrdiff_t>(k),
-      workspace->nearest.end(),
-      [&](const std::pair<float, uint32_t>& left,
-          const std::pair<float, uint32_t>& right) {
-        return left.first < right.first ||
-               (left.first == right.first &&
-                graph.labels[left.second] < graph.labels[right.second]);
-      });
-  for (size_t rank = 0; rank < k; ++rank) {
-    const auto& item = workspace->nearest[rank];
-    workspace->result.push_back({item.first, graph.labels[item.second]});
-  }
-  *out_neighbors = workspace->result.data();
-  *out_count = workspace->result.size();
-  return ynn_status_success;
+    *out_neighbors = workspace->result.data();
+    *out_count = workspace->result.size();
+    return ynn_status_success;
+}
+
+} // namespace
+
+ynn_status search_hnsw(const hnsw_search_index& index, const float* query, size_t query_width, size_t k, size_t ef,
+                       hnsw_workspace* workspace, const hnsw_neighbor** out_neighbors, size_t* out_count,
+                       hnsw_parallel_for_fn parallel_for) {
+    const bool has_parallel = static_cast<bool>(parallel_for);
+    return search_hnsw_impl(
+        index, query, query_width, k, ef, workspace, out_neighbors, out_count, has_parallel,
+        [&](size_t tasks, auto&& body) -> bool { return parallel_for(tasks, std::forward<decltype(body)>(body)); });
 }
 
 ynn_status search_hnsw(const hnsw_search_index& index, const float* query,
@@ -1012,8 +1001,26 @@ ynn_status search_hnsw(const hnsw_search_index& index, const float* query,
                        hnsw_workspace* workspace,
                        const hnsw_neighbor** out_neighbors, size_t* out_count,
                        ynn_threadpool_t threadpool) {
-  return search_hnsw(index, query, query_width, k, ef, workspace, out_neighbors,
-                     out_count, make_threadpool_parallel_for(threadpool));
+    auto* pool = reinterpret_cast<slinky::thread_pool*>(threadpool);
+    const bool has_parallel = pool != nullptr && pool->thread_count() > 0;
+    return search_hnsw_impl(index, query, query_width, k, ef, workspace, out_neighbors, out_count, has_parallel,
+                            [pool](size_t tasks, auto&& body) -> bool {
+                                pool->parallel_for(tasks, [&body](size_t idx) { body(idx); });
+                                return true;
+                            });
+}
+
+ynn_status search_hnsw(const hnsw_search_index& index, const float* query, size_t query_width, size_t k, size_t ef,
+                       hnsw_workspace* workspace, const hnsw_neighbor** out_neighbors, size_t* out_count,
+                       void* executor_context, hnsw_task_runner_fn task_runner) {
+    const bool has_parallel = task_runner != nullptr;
+    return search_hnsw_impl(index, query, query_width, k, ef, workspace, out_neighbors, out_count, has_parallel,
+                            [&](size_t tasks, auto&& body) -> bool {
+                                using Body = typename std::remove_reference<decltype(body)>::type;
+                                task_runner(executor_context, tasks, &body,
+                                            [](void* raw, size_t idx) { (*static_cast<Body*>(raw))(idx); });
+                                return true;
+                            });
 }
 
 }  // namespace ynn

@@ -37,6 +37,7 @@
 #include "ynnpack/subgraph/subgraph.h"
 #include "ynnpack/subgraph/utils.h"
 #include "slinky/base/arithmetic.h"
+#include "slinky/base/thread_pool.h"
 #include "slinky/builder/pipeline.h"
 #include "slinky/builder/simplify.h"
 #include "slinky/runtime/buffer.h"
@@ -452,8 +453,28 @@ auto make_dot_impl(dot_type type, bool consistent_arithmetic, bool symmetric_b,
     dot_packed_shape packed_shape;
     packed_shape.block_n = block_n;
     packed_shape.tile_k = tile_k;
-    dot_kernel kernel = get_dot_kernel(type, shape, packed_shape, kernel_flags,
-                                       require_transpose_a, arch_flags);
+    struct cached_dot_lookup {
+        dot_type type = {};
+        dot_shape shape = {};
+        dot_packed_shape packed = {};
+        uint32_t flags = 0;
+        uint64_t arch = 0;
+        int req_ta = -2;
+        dot_kernel kernel = {};
+    };
+    static thread_local cached_dot_lookup tls_cache;
+    const int req_ta = require_transpose_a ? (*require_transpose_a ? 1 : 0) : -1;
+    dot_kernel kernel;
+    if (tls_cache.kernel.kernel && tls_cache.type.a == type.a && tls_cache.type.b == type.b &&
+        tls_cache.type.c == type.c && tls_cache.shape.m == shape.m && tls_cache.shape.n == shape.n &&
+        tls_cache.shape.k1 == shape.k1 && tls_cache.shape.k2 == shape.k2 && tls_cache.shape.k3 == shape.k3 &&
+        tls_cache.packed.block_n == packed_shape.block_n && tls_cache.packed.tile_k == packed_shape.tile_k &&
+        tls_cache.flags == kernel_flags && tls_cache.arch == arch_flags && tls_cache.req_ta == req_ta) {
+        kernel = tls_cache.kernel;
+    } else {
+        kernel = get_dot_kernel(type, shape, packed_shape, kernel_flags, require_transpose_a, arch_flags);
+        tls_cache = {type, shape, packed_shape, kernel_flags, arch_flags, req_ta, kernel};
+    }
     assert(kernel.kernel);
     assert(tile_k == kernel.tile_k);
     const index_t block_m = kernel.block_m;
@@ -967,25 +988,22 @@ constexpr index_t max_multiplier_k = radix_k - 1;
 constexpr index_t step_m = 16;
 constexpr index_t step_k = 1024;
 
-std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
-                                                           index_t k,
-                                                           index_t block_n,
-                                                           size_t a_elem_size) {
-  assert(block_n > 0);
+std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n, index_t k, index_t block_n,
+                                                           size_t a_elem_size, index_t max_threads = 0) {
+    assert(block_n > 0);
 
-  // If k gets big, we're going to tile k anyways. It could be faster to
-  // parallelize more finely, but it will waste CPU cycles due to more memory
-  // traffic out of the cache.
-  const index_t effective_k = std::min<index_t>(k, step_k);
+    // If k gets big, we're going to tile k anyways. It could be faster to
+    // parallelize more finely, but it will waste CPU cycles due to more memory
+    // traffic out of the cache.
+    const index_t effective_k = std::min<index_t>(k, step_k);
 
-  // Considerations for task size:
-  // - We want tasks to be square-ish, to maximize the number of times we can
-  // use data we load from either side.
-  // - Tasks shouldn't be too small, to avoid parallelism overhead.
-  // - Tasks shouldn't be too large, so we get enough parallelism.
-  const index_t min_area_2d =
-      std::min<index_t>(m, 64) * std::min<index_t>(n, 64);
-  index_t min_area_1d = 256;
+    // Considerations for task size:
+    // - We want tasks to be square-ish, to maximize the number of times we can
+    // use data we load from either side.
+    // - Tasks shouldn't be too small, to avoid parallelism overhead.
+    // - Tasks shouldn't be too large, so we get enough parallelism.
+    const index_t min_area_2d = std::min<index_t>(m, 64) * std::min<index_t>(n, 64);
+    index_t min_area_1d = 256;
 #if defined(__x86_64__) || defined(_M_X64)
   if (m == 1 && a_elem_size == 1) min_area_1d = 64;
 #endif
@@ -1048,6 +1066,25 @@ std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
   index_t split_k = k >= k_threshold ? k_split_size : k;
   split_k = align_up<index_t>(split_k, step_k);
 
+  if (max_threads > 0) {
+      if (max_threads == 1 && m == 1 && split_k >= k) {
+          split_n = n;
+      } else if (max_threads > 1) {
+          const index_t m_tasks = std::max<index_t>(1, ceil_div(m, split_m));
+          // Refine `split_n` when medium N leaves threads idle, down to `block_n`.
+          while (split_n >= 2 * block_n && m_tasks * ceil_div(n, split_n) < max_threads) {
+              split_n = align_up<index_t>(split_n / 2, block_n);
+          }
+          // Coarsen `split_n` on wide 1D GEMVs so Slinky dispatches ~4x threads slices instead of micro-tasks.
+          if (m == 1 && split_k >= k) {
+              const index_t target_tasks = max_threads * 4;
+              if (ceil_div(n, split_n) > target_tasks) {
+                  split_n = std::max(split_n, align_up<index_t>(ceil_div(n, target_tasks), block_n));
+              }
+          }
+      }
+  }
+
   // Ensure the split factors do not exceed the maximum representable numbers
   // in the 32-bit packing scheme (11 bits for n, 11 bits for m, 9 bits for k).
   split_n = std::min<index_t>(split_n, max_multiplier_n * block_n);
@@ -1056,53 +1093,50 @@ std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
   return {split_n, split_m, split_k};
 }
 
-std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(
-    ynn_runtime& runtime, slinky::expr m, slinky::expr n, slinky::expr k,
-    slinky::expr block_n, size_t a_elem_size) {
-  auto impl = [=](const slinky::call* op,
-                  slinky::eval_context& ctx) -> index_t {
-    index_t m = evaluate(op->args[0], ctx);
-    index_t n = evaluate(op->args[1], ctx);
-    index_t k = evaluate(op->args[2], ctx);
-    index_t block_n = evaluate(op->args[3], ctx);
-    auto [split_n, split_m, split_k] =
-        choose_split_factors(m, n, k, block_n, a_elem_size);
-    index_t mult_n = std::max<index_t>(1, split_n / block_n);
-    index_t mult_m = std::max<index_t>(1, split_m / step_m);
-    index_t mult_k = std::max<index_t>(1, split_k / step_k);
-    return (mult_k * radix_m + mult_m) * radix_n + mult_n;
-  };
-  slinky::expr splits = slinky::call::make(impl, {m, n, k, block_n});
+std::tuple<slinky::expr, slinky::expr, slinky::expr> choose_split_factors(ynn_runtime& runtime, slinky::expr m,
+                                                                          slinky::expr n, slinky::expr k,
+                                                                          slinky::expr block_n, size_t a_elem_size,
+                                                                          bool consistent_arithmetic = false) {
+    auto impl = [=](const slinky::call* op, slinky::eval_context& ctx) -> index_t {
+        index_t m = evaluate(op->args[0], ctx);
+        index_t n = evaluate(op->args[1], ctx);
+        index_t k = evaluate(op->args[2], ctx);
+        index_t block_n = evaluate(op->args[3], ctx);
+        const index_t max_threads =
+            consistent_arithmetic
+                ? 0
+                : (ctx.config && ctx.config->thread_pool ? ctx.config->thread_pool->thread_count() + 1 : 1);
+        auto [split_n, split_m, split_k] = choose_split_factors(m, n, k, block_n, a_elem_size, max_threads);
+        index_t mult_n = std::max<index_t>(1, split_n / block_n);
+        index_t mult_m = std::max<index_t>(1, split_m / step_m);
+        index_t mult_k = std::max<index_t>(1, split_k / step_k);
+        return (mult_k * radix_m + mult_m) * radix_n + mult_n;
+    };
+    slinky::expr splits = slinky::call::make(impl, {m, n, k, block_n});
 
-  // Extract the splits from the single 32-bit index_t result.
-  splits = runtime.globals.get(splits, "dot_splits");
-  slinky::expr mult_n = splits % radix_n;
-  slinky::expr splits_m_k = splits / radix_n;
-  slinky::expr mult_m = splits_m_k % radix_m;
-  slinky::expr mult_k = splits_m_k / radix_m;
-  slinky::expr split_n = slinky::min(n, mult_n * block_n);
-  slinky::expr split_m = slinky::min(m, mult_m * step_m);
-  slinky::expr split_k = slinky::min(k, mult_k * step_k);
-  split_n = runtime.globals.get(split_n, "split_n");
-  split_m = runtime.globals.get(split_m, "split_m");
-  split_k = runtime.globals.get(split_k, "split_k");
+    // Extract the splits from the single 32-bit index_t result.
+    splits = runtime.globals.get(splits, "dot_splits");
+    slinky::expr mult_n = splits % radix_n;
+    slinky::expr splits_m_k = splits / radix_n;
+    slinky::expr mult_m = splits_m_k % radix_m;
+    slinky::expr mult_k = splits_m_k / radix_m;
+    slinky::expr split_n = slinky::min(n, mult_n * block_n);
+    slinky::expr split_m = slinky::min(m, mult_m * step_m);
+    slinky::expr split_k = slinky::min(k, mult_k * step_k);
+    split_n = runtime.globals.get(split_n, "split_n");
+    split_m = runtime.globals.get(split_m, "split_m");
+    split_k = runtime.globals.get(split_k, "split_k");
 
-  // The choose_split_factors is an opaque call behind global variables, but its
-  // result has provable structure: each split is min(extent, mult * step)
-  // with a multiplier in [1, max_multiplier]. Register those intervals for
-  // the globals so scheduler proofs and simplifications can reason about the
-  // steps without evaluating the call.
-  runtime.globals.learn_bounds(
-      split_m,
-      {slinky::min(m, step_m), slinky::min(m, max_multiplier_m * step_m)});
-  runtime.globals.learn_bounds(
-      split_n,
-      {slinky::min(n, block_n), slinky::min(n, max_multiplier_n * block_n)});
-  runtime.globals.learn_bounds(
-      split_k,
-      {slinky::min(k, step_k), slinky::min(k, max_multiplier_k * step_k)});
+    // The choose_split_factors is an opaque call behind global variables, but its
+    // result has provable structure: each split is min(extent, mult * step)
+    // with a multiplier in [1, max_multiplier]. Register those intervals for
+    // the globals so scheduler proofs and simplifications can reason about the
+    // steps without evaluating the call.
+    runtime.globals.learn_bounds(split_m, {slinky::min(m, step_m), slinky::min(m, max_multiplier_m * step_m)});
+    runtime.globals.learn_bounds(split_n, {slinky::min(n, block_n), slinky::min(n, max_multiplier_n * block_n)});
+    runtime.globals.learn_bounds(split_k, {slinky::min(k, step_k), slinky::min(k, max_multiplier_k * step_k)});
 
-  return {split_n, split_m, split_k};
+    return {split_n, split_m, split_k};
 }
 
 void learn_shape_from_b(dot_shape& shape, size_t num_k_dims,
@@ -1582,8 +1616,8 @@ ynn_status define_dot(ynn_subgraph& subgraph, size_t num_k_dims,
       k *= packed_b.extent(3 + d);
     }
 
-    auto [split_n, split_m, split_k] = choose_split_factors(
-        runtime, m, n, k, block_n, type_size_bytes(input_a.type));
+    auto [split_n, split_m, split_k] =
+        choose_split_factors(runtime, m, n, k, block_n, type_size_bytes(input_a.type), consistent_arithmetic);
 
     const int rank = output.rank();
     const bool is_split_k = slinky::prove_true(split_k < k);

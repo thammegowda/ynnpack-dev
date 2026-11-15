@@ -164,6 +164,13 @@ ynn_status search_hnsw(const hnsw_search_index& index, const float* query,
                        const hnsw_neighbor** out_neighbors, size_t* out_count,
                        ynn_threadpool_t threadpool);
 
+using hnsw_task_runner_fn = void (*)(void* executor_context, size_t task_count, void* body_context,
+                                     void (*body)(void* body_context, size_t task_index));
+
+ynn_status search_hnsw(const hnsw_search_index& index, const float* query, size_t query_width, size_t k, size_t ef,
+                       hnsw_workspace* workspace, const hnsw_neighbor** out_neighbors, size_t* out_count,
+                       void* executor_context, hnsw_task_runner_fn task_runner);
+
 }  // namespace ynn
 
 #endif  // XNNPACK_YNNPACK_COMPOSITES_HNSW_H_

@@ -79,17 +79,49 @@ void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k, size_t block_
 void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k, size_t block_size, bool compute_bsum,
                                         const float* input, int8_t* quantized_input, float* input_scales,
                                         float* input_bsums, size_t row_start, size_t row_end);
+void quantize_blockwise_blocks_f32(int32_t bits, size_t m, size_t k, size_t block_size, bool compute_bsum,
+                                   const float* input, int8_t* quantized_input, float* input_scales, float* input_bsums,
+                                   size_t block_start, size_t block_end);
 void blockwise_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, bool has_zero,
                           float output_scale, const void* packed_tiles, const int8_t* quantized_input,
                           const float* input_scales, const float* input_bsums, float* output, size_t tile_start,
                           size_t tile_end);
 
+bool is_symmetric_linear_supported(int32_t bits);
+size_t symmetric_linear_padded_block(size_t block_size);
+size_t packed_symmetric_linear_size(int32_t bits, size_t n, size_t k, size_t block_size);
+void pack_symmetric_linear_tiles(int32_t bits, size_t n, size_t k, size_t row_offset, size_t block_size,
+                                 const void* weights, const void* scales, bool scales_fp16, size_t tile_start,
+                                 size_t tile_end, void* packed_tiles);
+void quantize_symmetric_blocks_f32(int32_t bits, size_t m, size_t k, size_t block_size, float static_scale,
+                                   const float* input, int8_t* quantized_input, float* input_scales, size_t block_start,
+                                   size_t block_end);
+void symmetric_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, float output_scale,
+                          const void* packed_tiles, const int8_t* quantized_input, const float* input_scales,
+                          float* output, size_t output_stride, size_t tile_start, size_t tile_end);
+
 void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
                                    size_t row_count, size_t col_start, size_t col_count, uint8_t* destination);
+size_t gated_activation_tile_count(size_t rows, size_t width);
 ynn_status silu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
                          size_t row_end);
+ynn_status silu_gate_tiles_f32(size_t rows, size_t width, const float* input, float* output, size_t tile_start,
+                               size_t tile_end);
 ynn_status gelu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
                          size_t row_end);
+ynn_status gelu_gate_tiles_f32(size_t rows, size_t width, const float* input, float* output, size_t tile_start,
+                               size_t tile_end);
+size_t gated_multiply_tile_count(size_t elements);
+ynn_status silu_multiply_tiles_f32(size_t elements, const float* gate, const float* up, float* output,
+                                   size_t tile_start, size_t tile_end);
+ynn_status gelu_multiply_tiles_f32(size_t elements, const float* gate, const float* up, float* output,
+                                   size_t tile_start, size_t tile_end);
+ynn_status packed_ffn_mid_tiles_f32(int32_t bits, size_t m, size_t input_size, size_t intermediate_size,
+                                    float gate_output_scale, float down_input_scale, bool silu, const void* gate_packed,
+                                    const void* up_packed, const int8_t* quantized_input, const float* input_scales,
+                                    int8_t* quantized_mid, size_t tile_start, size_t tile_end);
+void elementwise_binary_f32(bool is_multiply, size_t elements, size_t rhs_stride, const float* lhs, const float* rhs,
+                            float* output, size_t start, size_t end);
 
 void rms_norm_f32(size_t rows, size_t width, float epsilon, const float* input, const float* weight,
                   const float* residual, bool has_scale, float scale, float* output, size_t row_start, size_t row_end);
@@ -105,6 +137,8 @@ void dequantize_embedding_f32(const int32_t* tokens, size_t num_tokens, const vo
                               const void* scales, bool scales_fp16, const void* zeros, bool zeros_fp16,
                               float multiplier, float* output, size_t row_start, size_t row_end);
 void quantize_symmetric_int8_f32(size_t count, float scale, const float* input, int8_t* output);
+void argmax_chunk_f32(size_t count, const float* row_logits, size_t col_offset, float* out_max, int32_t* out_index,
+                      bool* out_invalid);
 void argmax_rows_f32(size_t rows, size_t width, const float* logits, int32_t* tokens);
 
 // gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
