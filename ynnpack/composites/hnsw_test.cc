@@ -212,6 +212,41 @@ TEST(HnswCompositesTest, QuantizedSearchMatchesSlices4AndScalar) {
         true, ws.q_i8.data(), ws.q_scale.data(), ws.q_bsum.data());
     EXPECT_NEAR(s4[i], s1, 1e-5f);
   }
+
+  // Reusing the same workspace (which currently holds non-zero INT4 q_bsum values) for a static-scale symmetric INT8
+  // search must zero q_bsum[b] and match a fresh workspace without subtracting spurious weight-sum corrections.
+  std::vector<uint8_t> i8_weights(rows * width);
+  std::vector<float> i8_scales(rows * blocks, 0.03125f);
+  for (size_t r = 0; r < rows; ++r) {
+      for (size_t c = 0; c < width; ++c) {
+          const auto v = static_cast<int8_t>(static_cast<int>((r * 13 + c * 7) % 121) - 60);
+          i8_weights[r * width + c] = static_cast<uint8_t>(v);
+      }
+  }
+  hnsw_search_index i8_idx;
+  ASSERT_EQ(prepare_hnsw_quantized_search(graph, i8_weights.data(), i8_scales.data(), /*scale_fp16=*/false, nullptr,
+                                          /*zero_fp16=*/false, /*bits=*/8, static_cast<int32_t>(group),
+                                          /*input_scale=*/0.05f, &i8_idx),
+            ynn_status_success);
+
+  // Poison ws.q_bsum with large non-zero values before static-scale INT8 search.
+  std::fill(ws.q_bsum.begin(), ws.q_bsum.end(), 42.0f);
+  const hnsw_neighbor* reused_found = nullptr;
+  size_t reused_count = 0;
+  ASSERT_EQ(search_hnsw(i8_idx, query.data(), width, rows, rows, &ws, &reused_found, &reused_count),
+            ynn_status_success);
+  for (float zb : ws.q_bsum) EXPECT_FLOAT_EQ(zb, 0.0f);
+
+  hnsw_workspace fresh_ws;
+  const hnsw_neighbor* fresh_found = nullptr;
+  size_t fresh_count = 0;
+  ASSERT_EQ(search_hnsw(i8_idx, query.data(), width, rows, rows, &fresh_ws, &fresh_found, &fresh_count),
+            ynn_status_success);
+  ASSERT_EQ(reused_count, fresh_count);
+  for (size_t i = 0; i < reused_count; ++i) {
+      EXPECT_EQ(reused_found[i].id, fresh_found[i].id);
+      EXPECT_FLOAT_EQ(reused_found[i].distance, fresh_found[i].distance);
+  }
 }
 
 }  // namespace

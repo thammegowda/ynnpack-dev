@@ -134,21 +134,21 @@ ynn_status define_packed_feed_forward(
 
 void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
                                    size_t row_count, size_t col_start, size_t col_count, uint8_t* destination) {
-  const size_t values_per_byte = static_cast<size_t>(8 / bits);
-  const size_t destination_row_bytes = row_count / values_per_byte;
-  std::memset(destination, 0, col_count * destination_row_bytes);
-  const uint8_t mask = static_cast<uint8_t>((1 << bits) - 1);
-  for (size_t row = 0; row < row_count; ++row) {
-    for (size_t column = 0; column < col_count; ++column) {
-      const size_t source_column = col_start + column;
-      const uint8_t value = static_cast<uint8_t>(
-          (source[(row_start + row) * source_stride_bytes + source_column / values_per_byte] >>
-           ((source_column % values_per_byte) * bits)) &
-          mask);
-      destination[column * destination_row_bytes + row / values_per_byte] |=
-          static_cast<uint8_t>(value << ((row % values_per_byte) * bits));
+    const size_t values_per_byte = static_cast<size_t>(8 / bits);
+    const size_t destination_row_bytes = (row_count + values_per_byte - 1) / values_per_byte;
+    std::memset(destination, 0, col_count * destination_row_bytes);
+    const uint8_t mask = static_cast<uint8_t>((1 << bits) - 1);
+    for (size_t row = 0; row < row_count; ++row) {
+        for (size_t column = 0; column < col_count; ++column) {
+            const size_t source_column = col_start + column;
+            const uint8_t value = static_cast<uint8_t>(
+                (source[(row_start + row) * source_stride_bytes + source_column / values_per_byte] >>
+                 ((source_column % values_per_byte) * bits)) &
+                mask);
+            destination[column * destination_row_bytes + row / values_per_byte] |=
+                static_cast<uint8_t>(value << ((row % values_per_byte) * bits));
+        }
     }
-  }
 }
 
 size_t gated_activation_tile_count(size_t rows, size_t width) {

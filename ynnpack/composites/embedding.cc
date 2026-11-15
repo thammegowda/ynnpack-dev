@@ -21,20 +21,23 @@ namespace {
 
 float fp16_to_fp32_scalar(uint16_t h) {
 #if defined(__aarch64__) || defined(__arm64__)
-  __fp16 val;
-  std::memcpy(&val, &h, sizeof(val));
-  return static_cast<float>(val);
+    __fp16 val;
+    std::memcpy(&val, &h, sizeof(val));
+    return static_cast<float>(val);
 #else
-  const uint32_t sign = static_cast<uint32_t>(h & 0x8000U) << 16;
-  const uint32_t exp = (h >> 10) & 0x1FU;
-  const uint32_t mant = h & 0x03FFU;
-  const uint32_t bits =
-      exp == 0 ? sign
-               : (exp == 31 ? (sign | 0x7F800000U | (mant << 13))
-                            : (sign | ((exp + 112U) << 23) | (mant << 13)));
-  float out = 0.0f;
-  std::memcpy(&out, &bits, sizeof(out));
-  return out;
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000U) << 16;
+    const uint32_t exp = (h >> 10) & 0x1FU;
+    const uint32_t mant = h & 0x03FFU;
+    if (exp == 0 && mant != 0) {
+        const float sub = static_cast<float>(mant) * (1.0f / 16777216.0f);
+        return (h & 0x8000U) ? -sub : sub;
+    }
+    const uint32_t bits =
+        exp == 0 ? sign
+                 : (exp == 31 ? (sign | 0x7F800000U | (mant << 13)) : (sign | ((exp + 112U) << 23) | (mant << 13)));
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
 #endif
 }
 

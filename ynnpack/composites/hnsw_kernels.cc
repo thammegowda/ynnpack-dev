@@ -149,29 +149,29 @@ __attribute__((target("avx512f,avx512bw,fma"))) float dot_avx512(
 }
 
 template <bool BFloat>
+__attribute__((target("avx512f,avx512bw,fma"))) inline __m512 load_avx512_row(const void* row, size_t col) {
+    if constexpr (BFloat) {
+        const auto* bytes = static_cast<const uint8_t*>(row);
+        const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + col * sizeof(uint16_t)));
+        return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16));
+    } else {
+        return _mm512_loadu_ps(static_cast<const float*>(row) + col);
+    }
+}
+
+template <bool BFloat>
 __attribute__((target("avx512f,avx512bw,fma"))) void dot4_avx512(
     const float* query, const void* r0, const void* r1, const void* r2,
     const void* r3, size_t width, float out[4]) {
   __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
   __m512 s2 = _mm512_setzero_ps(), s3 = _mm512_setzero_ps();
-  const auto load = [](const void* row, size_t col) {
-    if constexpr (BFloat) {
-      const auto* bytes = static_cast<const uint8_t*>(row);
-      const __m256i packed = _mm256_loadu_si256(
-          reinterpret_cast<const __m256i*>(bytes + col * sizeof(uint16_t)));
-      return _mm512_castsi512_ps(
-          _mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16));
-    } else {
-      return _mm512_loadu_ps(static_cast<const float*>(row) + col);
-    }
-  };
   size_t column = 0;
   for (; column + 16 <= width; column += 16) {
     const __m512 q = _mm512_loadu_ps(query + column);
-    s0 = _mm512_fmadd_ps(q, load(r0, column), s0);
-    s1 = _mm512_fmadd_ps(q, load(r1, column), s1);
-    s2 = _mm512_fmadd_ps(q, load(r2, column), s2);
-    s3 = _mm512_fmadd_ps(q, load(r3, column), s3);
+    s0 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r0, column), s0);
+    s1 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r1, column), s1);
+    s2 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r2, column), s2);
+    s3 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r3, column), s3);
   }
   out[0] = _mm512_reduce_add_ps(s0);
   out[1] = _mm512_reduce_add_ps(s1);
@@ -224,24 +224,13 @@ __attribute__((target("avx512f,avx512bw,fma"))) void dot_rows4_avx512(
     const void* r3, size_t width, float out[4]) {
   __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
   __m512 s2 = _mm512_setzero_ps(), s3 = _mm512_setzero_ps();
-  const auto load = [](const void* row, size_t col) {
-    if constexpr (BFloat) {
-      const auto* bytes = static_cast<const uint8_t*>(row);
-      const __m256i packed = _mm256_loadu_si256(
-          reinterpret_cast<const __m256i*>(bytes + col * sizeof(uint16_t)));
-      return _mm512_castsi512_ps(
-          _mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16));
-    } else {
-      return _mm512_loadu_ps(static_cast<const float*>(row) + col);
-    }
-  };
   size_t column = 0;
   for (; column + 16 <= width; column += 16) {
-    const __m512 q = load(query, column);
-    s0 = _mm512_fmadd_ps(q, load(r0, column), s0);
-    s1 = _mm512_fmadd_ps(q, load(r1, column), s1);
-    s2 = _mm512_fmadd_ps(q, load(r2, column), s2);
-    s3 = _mm512_fmadd_ps(q, load(r3, column), s3);
+      const __m512 q = load_avx512_row<BFloat>(query, column);
+      s0 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r0, column), s0);
+      s1 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r1, column), s1);
+      s2 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r2, column), s2);
+      s3 = _mm512_fmadd_ps(q, load_avx512_row<BFloat>(r3, column), s3);
   }
   out[0] = _mm512_reduce_add_ps(s0);
   out[1] = _mm512_reduce_add_ps(s1);
@@ -636,6 +625,15 @@ YNN_HNSW_TARGET_DOTPROD_FP16 float quantized_slice_dot_int4_neon(
   return vaddvq_f32(f0);
 }
 
+template <bool F16>
+YNN_HNSW_TARGET_DOTPROD_FP16 inline float32x4_t load_meta4_neon(const uint8_t* base) noexcept {
+    if constexpr (F16) {
+        return vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(base)));
+    } else {
+        return vld1q_f32(reinterpret_cast<const float*>(base));
+    }
+}
+
 template <bool ScaleF16, bool HasZero, bool ZeroF16>
 YNN_HNSW_TARGET_DOTPROD_FP16 void quantized_slices4_dot_int4_neon(
     const uint8_t* p0, const uint8_t* p1, const uint8_t* p2, const uint8_t* p3,
@@ -697,33 +695,17 @@ YNN_HNSW_TARGET_DOTPROD_FP16 void quantized_slices4_dot_int4_neon(
                                vmulq_f32(vcvt_f32_f16(vget_low_f16(sz3)), qs)),
                      vcvt_high_f32_f16(sz3), qz);
     } else {
-      const auto load_scale = [](const uint8_t* base) noexcept -> float32x4_t {
-        if constexpr (ScaleF16) {
-          return vcvt_f32_f16(vld1_f16(reinterpret_cast<const __fp16*>(base)));
-        } else {
-          return vld1q_f32(reinterpret_cast<const float*>(base));
+        f0 = vfmaq_f32(f0, vcvtq_f32_s32(d0), vmulq_f32(load_meta4_neon<ScaleF16>(p0), qs));
+        f1 = vfmaq_f32(f1, vcvtq_f32_s32(d1), vmulq_f32(load_meta4_neon<ScaleF16>(p1), qs));
+        f2 = vfmaq_f32(f2, vcvtq_f32_s32(d2), vmulq_f32(load_meta4_neon<ScaleF16>(p2), qs));
+        f3 = vfmaq_f32(f3, vcvtq_f32_s32(d3), vmulq_f32(load_meta4_neon<ScaleF16>(p3), qs));
+        if constexpr (HasZero) {
+            const float32x4_t qz = vld1q_f32(q_bsum + b);
+            f0 = vfmaq_f32(f0, load_meta4_neon<ZeroF16>(p0 + s_step), qz);
+            f1 = vfmaq_f32(f1, load_meta4_neon<ZeroF16>(p1 + s_step), qz);
+            f2 = vfmaq_f32(f2, load_meta4_neon<ZeroF16>(p2 + s_step), qz);
+            f3 = vfmaq_f32(f3, load_meta4_neon<ZeroF16>(p3 + s_step), qz);
         }
-      };
-      f0 = vfmaq_f32(f0, vcvtq_f32_s32(d0), vmulq_f32(load_scale(p0), qs));
-      f1 = vfmaq_f32(f1, vcvtq_f32_s32(d1), vmulq_f32(load_scale(p1), qs));
-      f2 = vfmaq_f32(f2, vcvtq_f32_s32(d2), vmulq_f32(load_scale(p2), qs));
-      f3 = vfmaq_f32(f3, vcvtq_f32_s32(d3), vmulq_f32(load_scale(p3), qs));
-      if constexpr (HasZero) {
-        const float32x4_t qz = vld1q_f32(q_bsum + b);
-        const auto load_zero =
-            [](const uint8_t* base) noexcept -> float32x4_t {
-          if constexpr (ZeroF16) {
-            return vcvt_f32_f16(
-                vld1_f16(reinterpret_cast<const __fp16*>(base)));
-          } else {
-            return vld1q_f32(reinterpret_cast<const float*>(base));
-          }
-        };
-        f0 = vfmaq_f32(f0, load_zero(p0 + s_step), qz);
-        f1 = vfmaq_f32(f1, load_zero(p1 + s_step), qz);
-        f2 = vfmaq_f32(f2, load_zero(p2 + s_step), qz);
-        f3 = vfmaq_f32(f3, load_zero(p3 + s_step), qz);
-      }
     }
     p0 += s_step + z_step;
     p1 += s_step + z_step;
@@ -861,6 +843,15 @@ YNN_HNSW_TARGET_DOTPROD int32_t dot_i2_block_neon(const uint8_t* wp,
   return dot_i32;
 }
 
+YNN_HNSW_TARGET_DOTPROD inline int32x4_t dot_i2_chunk16_neon(int32x4_t acc, const uint8_t* wp, int8x16_t qv0,
+                                                             int8x16_t qv1, int8x16_t qv2, int8x16_t qv3) noexcept {
+    const int8x16_t raw = vreinterpretq_s8_u8(vld1q_u8(wp));
+    acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 6), 6), qv0);
+    acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 4), 6), qv1);
+    acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 2), 6), qv2);
+    return vdotq_s32(acc, vshrq_n_s8(raw, 6), qv3);
+}
+
 YNN_HNSW_TARGET_DOTPROD void dot4_i2_slices_neon(
     const uint8_t* s0, const uint8_t* s1, const uint8_t* s2, const uint8_t* s3,
     size_t B, size_t G, size_t row_bytes, bool scale_fp16, const int8_t* q_i8,
@@ -881,17 +872,10 @@ YNN_HNSW_TARGET_DOTPROD void dot4_i2_slices_neon(
       const int8x16_t qv1 = vld1q_s8(qp + 1 * quarter + c);
       const int8x16_t qv2 = vld1q_s8(qp + 2 * quarter + c);
       const int8x16_t qv3 = vld1q_s8(qp + 3 * quarter + c);
-      const auto dot_row = [&](int32x4_t acc, const uint8_t* wp) noexcept {
-        const int8x16_t raw = vreinterpretq_s8_u8(vld1q_u8(wp + b * quarter + c));
-        acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 6), 6), qv0);
-        acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 4), 6), qv1);
-        acc = vdotq_s32(acc, vshrq_n_s8(vshlq_n_s8(raw, 2), 6), qv2);
-        return vdotq_s32(acc, vshrq_n_s8(raw, 6), qv3);
-      };
-      a0 = dot_row(a0, s0);
-      a1 = dot_row(a1, s1);
-      a2 = dot_row(a2, s2);
-      a3 = dot_row(a3, s3);
+      a0 = dot_i2_chunk16_neon(a0, s0 + b * quarter + c, qv0, qv1, qv2, qv3);
+      a1 = dot_i2_chunk16_neon(a1, s1 + b * quarter + c, qv0, qv1, qv2, qv3);
+      a2 = dot_i2_chunk16_neon(a2, s2 + b * quarter + c, qv0, qv1, qv2, qv3);
+      a3 = dot_i2_chunk16_neon(a3, s3 + b * quarter + c, qv0, qv1, qv2, qv3);
     }
     int32_t d0 = vaddvq_s32(a0), d1 = vaddvq_s32(a1);
     int32_t d2 = vaddvq_s32(a2), d3 = vaddvq_s32(a3);
@@ -1097,11 +1081,11 @@ void hnsw_prepare_quantized_query(const float* query, size_t width,
     q_scale[b] = scale;
     const float min_q = input_scale > 0.0f ? -128.0f : -127.0f;
     if (bits == 8) {
-      int8_t* dst = q_i8.data() + b * G;
-      for (size_t i = 0; i < G; ++i) {
-        dst[i] = static_cast<int8_t>(
-            std::clamp(std::nearbyint(x[i] * inv_scale), min_q, 127.0f));
-      }
+        q_bsum[b] = 0.0f;
+        int8_t* dst = q_i8.data() + b * G;
+        for (size_t i = 0; i < G; ++i) {
+            dst[i] = static_cast<int8_t>(std::clamp(std::nearbyint(x[i] * inv_scale), min_q, 127.0f));
+        }
     } else if (bits == 4) {
       const size_t chunks = G / 32;
       int32_t bsum = 0;
@@ -1142,18 +1126,19 @@ void hnsw_prepare_quantized_query(const float* query, size_t width,
       }
       q_bsum[b] = static_cast<float>(bsum) * scale;
     } else if (bits == 2) {
-      const size_t quarter = G / 4;
-      int8_t* dst = q_i8.data() + b * G;
-      for (size_t i = 0; i < quarter; ++i) {
-        dst[0 * quarter + i] = static_cast<int8_t>(
-            std::clamp(std::nearbyint(x[4 * i + 0] * inv_scale), min_q, 127.0f));
-        dst[1 * quarter + i] = static_cast<int8_t>(
-            std::clamp(std::nearbyint(x[4 * i + 1] * inv_scale), min_q, 127.0f));
-        dst[2 * quarter + i] = static_cast<int8_t>(
-            std::clamp(std::nearbyint(x[4 * i + 2] * inv_scale), min_q, 127.0f));
-        dst[3 * quarter + i] = static_cast<int8_t>(
-            std::clamp(std::nearbyint(x[4 * i + 3] * inv_scale), min_q, 127.0f));
-      }
+        q_bsum[b] = 0.0f;
+        const size_t quarter = G / 4;
+        int8_t* dst = q_i8.data() + b * G;
+        for (size_t i = 0; i < quarter; ++i) {
+            dst[0 * quarter + i] =
+                static_cast<int8_t>(std::clamp(std::nearbyint(x[4 * i + 0] * inv_scale), min_q, 127.0f));
+            dst[1 * quarter + i] =
+                static_cast<int8_t>(std::clamp(std::nearbyint(x[4 * i + 1] * inv_scale), min_q, 127.0f));
+            dst[2 * quarter + i] =
+                static_cast<int8_t>(std::clamp(std::nearbyint(x[4 * i + 2] * inv_scale), min_q, 127.0f));
+            dst[3 * quarter + i] =
+                static_cast<int8_t>(std::clamp(std::nearbyint(x[4 * i + 3] * inv_scale), min_q, 127.0f));
+        }
     }
   }
 }

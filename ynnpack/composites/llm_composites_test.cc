@@ -48,21 +48,36 @@ TEST(LlmCompositesTest, ArgmaxAndSymmetricInt8Quantization) {
 }
 
 TEST(LlmCompositesTest, TransposePackedSubbyteTile) {
-  // 4 rows x 6 logical columns of 4-bit values (3 bytes/row).
-  const std::vector<uint8_t> src = {
-      0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x1F, 0x32, 0x54, 0x76, 0x98,
-  };
-  std::vector<uint8_t> dst(4 * 2,
-                           0);  // 4 cols (col 1..4) x (4 rows / 2 = 2 bytes)
-  transpose_packed_subbyte_tile(4, src.data(), 3, /*row_start=*/0,
-                                /*row_count=*/4,
-                                /*col_start=*/1, /*col_count=*/4, dst.data());
-  // col 1 across rows 0..3: nibbles (2, 8, E, 5) -> bytes [0x82, 0x5E]
-  EXPECT_EQ(dst[0], 0x82);
-  EXPECT_EQ(dst[1], 0x5E);
-  // col 2 across rows 0..3: nibbles (3, 9, F, 6) -> bytes [0x93, 0x6F]
-  EXPECT_EQ(dst[2], 0x93);
-  EXPECT_EQ(dst[3], 0x6F);
+    // 4 rows x 6 logical columns of 4-bit values (3 bytes/row).
+    const std::vector<uint8_t> src = {
+        0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x1F, 0x32, 0x54, 0x76, 0x98,
+    };
+    std::vector<uint8_t> dst(4 * 2, 0); // 4 cols (col 1..4) x (4 rows / 2 = 2 bytes)
+    transpose_packed_subbyte_tile(4, src.data(), 3, /*row_start=*/0, /*row_count=*/4, /*col_start=*/1,
+                                  /*col_count=*/4, dst.data());
+    // col 1 across rows 0..3: nibbles (2, 8, E, 5) -> bytes [0x82, 0x5E]
+    EXPECT_EQ(dst[0], 0x82);
+    EXPECT_EQ(dst[1], 0x5E);
+    // col 2 across rows 0..3: nibbles (3, 9, F, 6) -> bytes [0x93, 0x6F]
+    EXPECT_EQ(dst[2], 0x93);
+    EXPECT_EQ(dst[3], 0x6F);
+
+    // Partial-byte row_count = 3 (needs ceil(3 / 2) = 2 bytes per destination column, with sentinel guard bytes).
+    std::vector<uint8_t> partial_dst(3 * 2 + 2, 0xAA);
+    transpose_packed_subbyte_tile(4, src.data(), 3, /*row_start=*/0, /*row_count=*/3, /*col_start=*/1,
+                                  /*col_count=*/3, partial_dst.data());
+    // col 1 across rows 0..2: nibbles (2, 8, E) -> [0x82, 0x0E]
+    EXPECT_EQ(partial_dst[0], 0x82);
+    EXPECT_EQ(partial_dst[1], 0x0E);
+    // col 2 across rows 0..2: nibbles (3, 9, F) -> [0x93, 0x0F]
+    EXPECT_EQ(partial_dst[2], 0x93);
+    EXPECT_EQ(partial_dst[3], 0x0F);
+    // col 3 across rows 0..2: nibbles (4, A, 1) -> [0xA4, 0x01]
+    EXPECT_EQ(partial_dst[4], 0xA4);
+    EXPECT_EQ(partial_dst[5], 0x01);
+    // Sentinel guard bytes past col_count * ceil(row_count / 2) must remain untouched.
+    EXPECT_EQ(partial_dst[6], 0xAA);
+    EXPECT_EQ(partial_dst[7], 0xAA);
 }
 
 TEST(LlmCompositesTest, GatedActivations) {
@@ -146,81 +161,92 @@ TEST(LlmCompositesTest, DequantizeEmbeddingVariants) {
   for (size_t i = 0; i < weights.size(); ++i)
     weights[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
   for (size_t i = 0; i < scales.size(); ++i) {
-    scales[i] = half(0.125f * static_cast<float>((i % 3) + 1));
-    zeros[i] = half(-0.25f * static_cast<float>(i % 2));
+      scales[i] = half(0.125f * static_cast<float>((i % 3) + 1));
+      zeros[i] = half(-0.25f * static_cast<float>(i % 2));
   }
+  // Include positive and negative FP16 subnormals to verify non-ARM scalar conversion preserves 2^-24 mantissas.
+  scales[0] = half::from_bits(0x0001u); // +2^-24
+  zeros[0] = half::from_bits(0x8002u);  // -2^-23
   const std::vector<int32_t> tokens = {3, 0, 2};
   std::vector<float> out(tokens.size() * width, 0.0f);
-  dequantize_embedding_f32(
-      tokens.data(), tokens.size(), weights.data(), /*weights_bf16=*/false,
-      /*packed_bits=*/4, /*unsigned_packed=*/false, width, groups,
-      scales.data(),
-      /*scales_fp16=*/true, zeros.data(), /*zeros_fp16=*/true,
-      /*multiplier=*/2.0f, out.data(), 0, tokens.size());
+  dequantize_embedding_f32(tokens.data(), tokens.size(), weights.data(), /*weights_bf16=*/false,
+                           /*packed_bits=*/4, /*unsigned_packed=*/false, width, groups, scales.data(),
+                           /*scales_fp16=*/true, zeros.data(), /*zeros_fp16=*/true,
+                           /*multiplier=*/2.0f, out.data(), 0, tokens.size());
   for (size_t r = 0; r < tokens.size(); ++r) {
-    const size_t tok = static_cast<size_t>(tokens[r]);
-    for (size_t c = 0; c < width; ++c) {
-      const size_t off = tok * width + c;
-      const uint8_t raw = (weights[off / 2] >> ((off % 2) * 4)) & 0xF;
-      const int val = (static_cast<int>(raw) ^ 8) - 8;
-      const size_t g = tok * groups + c / (width / groups);
-      const float expected =
-          (static_cast<float>(val) * static_cast<float>(scales[g]) +
-           static_cast<float>(zeros[g])) *
-          2.0f;
-      EXPECT_NEAR(out[r * width + c], expected, 1e-5f);
-    }
+      const size_t tok = static_cast<size_t>(tokens[r]);
+      for (size_t c = 0; c < width; ++c) {
+          const size_t off = tok * width + c;
+          const uint8_t raw = (weights[off / 2] >> ((off % 2) * 4)) & 0xF;
+          const int val = (static_cast<int>(raw) ^ 8) - 8;
+          const size_t g = tok * groups + c / (width / groups);
+          const float expected =
+              (static_cast<float>(val) * static_cast<float>(scales[g]) + static_cast<float>(zeros[g])) * 2.0f;
+          EXPECT_NEAR(out[r * width + c], expected, 1e-5f);
+      }
   }
+  // Explicitly verify row 1 (token 0, group 0) retained non-zero subnormal contribution rather than flushing to 0.
+  EXPECT_GT(std::abs(out[1 * width + 0]), 0.0f);
 }
 
 TEST(LlmCompositesTest, AttentionF32Gqa8AndGeneral) {
-  const size_t total_keys = 6, head_dim = 12;
-  std::vector<float> query(8 * head_dim);
-  std::vector<float> key(total_keys * head_dim);
-  std::vector<float> value(total_keys * head_dim);
-  std::vector<float> mask = {0.0f, -0.2f, 0.1f, -1e9f, -1e9f, -1e9f};
-  for (size_t i = 0; i < query.size(); ++i)
-    query[i] = 0.05f * static_cast<float>((i % 9) - 4);
-  for (size_t i = 0; i < key.size(); ++i) {
-    key[i] = 0.07f * static_cast<float>((i % 11) - 5);
-    value[i] = 0.1f * static_cast<float>((i % 7) - 3);
-  }
+    const size_t total_keys = 6, head_dim = 12;
+    std::vector<float> query(8 * head_dim);
+    std::vector<float> key(total_keys * head_dim);
+    std::vector<float> value(total_keys * head_dim);
+    std::vector<float> mask = {0.0f, -0.2f, 0.1f, -1e9f, -1e9f, -1e9f};
+    for (size_t i = 0; i < query.size(); ++i) query[i] = 0.05f * static_cast<float>(static_cast<int>(i % 9) - 4);
+    for (size_t i = 0; i < key.size(); ++i) {
+        key[i] = 0.07f * static_cast<float>(static_cast<int>(i % 11) - 5);
+        value[i] = 0.1f * static_cast<float>(static_cast<int>(i % 7) - 3);
+    }
 
-  attention_f32_params fast_params{};
-  fast_params.batch_size = 1;
-  fast_params.query_length = 1;
-  fast_params.query_heads = 8;
-  fast_params.key_value_heads = 1;
-  fast_params.key_start = 0;
-  fast_params.key_length = total_keys;
-  fast_params.total_keys = total_keys;
-  fast_params.head_dim = head_dim;
-  fast_params.mask_key_stride = 1;
-  fast_params.scale = 0.25f;
+    attention_f32_params fast_params{};
+    fast_params.batch_size = 1;
+    fast_params.query_length = 1;
+    fast_params.query_heads = 8;
+    fast_params.key_value_heads = 1;
+    fast_params.key_start = 0;
+    fast_params.key_length = total_keys;
+    fast_params.total_keys = total_keys;
+    fast_params.head_dim = head_dim;
+    fast_params.mask_key_stride = 1;
+    fast_params.scale = 0.25f;
 
-  ASSERT_EQ(attention_f32_work_items(fast_params), 1u);
-  std::vector<float> fast_scratch(attention_f32_scratch_size(fast_params));
-  std::vector<float> fast_out(8 * head_dim, -1.0f);
-  attention_f32(fast_params, query.data(), key.data(), value.data(),
-                mask.data(), fast_out.data(), 0, 1, fast_scratch.data());
+    const size_t fast_items = attention_f32_work_items(fast_params);
+    ASSERT_EQ(fast_items, 4u);
+    std::vector<float> fast_scratch(attention_f32_scratch_size(fast_params));
+    std::vector<float> fast_out(8 * head_dim, -1.0f);
+    attention_f32(fast_params, query.data(), key.data(), value.data(), mask.data(), fast_out.data(), 0, fast_items,
+                  fast_scratch.data());
 
-  // Force general path by setting mask_head_stride != 0 with identical
-  // broadcast mask rows.
-  std::vector<float> head_mask(8 * total_keys);
-  for (size_t h = 0; h < 8; ++h) {
-    std::copy(mask.begin(), mask.end(), head_mask.begin() + h * total_keys);
-  }
-  attention_f32_params gen_params = fast_params;
-  gen_params.mask_head_stride = total_keys;
-  ASSERT_EQ(attention_f32_work_items(gen_params), 8u);
-  std::vector<float> gen_scratch(attention_f32_scratch_size(gen_params));
-  std::vector<float> gen_out(8 * head_dim, -2.0f);
-  attention_f32(gen_params, query.data(), key.data(), value.data(),
-                head_mask.data(), gen_out.data(), 0, 8, gen_scratch.data());
+    // Also verify single-item invocation across each of the 4 head-pair items matches full-range execution.
+    std::vector<float> split_out(8 * head_dim, -3.0f);
+    for (size_t item = 0; item < fast_items; ++item) {
+        std::vector<float> item_scratch(attention_f32_scratch_size(fast_params), -99.0f);
+        attention_f32(fast_params, query.data(), key.data(), value.data(), mask.data(), split_out.data(), item,
+                      item + 1, item_scratch.data());
+    }
+    for (size_t i = 0; i < fast_out.size(); ++i) {
+        EXPECT_FLOAT_EQ(split_out[i], fast_out[i]);
+    }
 
-  for (size_t i = 0; i < fast_out.size(); ++i) {
-    EXPECT_NEAR(fast_out[i], gen_out[i], 1e-5f);
-  }
+    // Force general path by setting mask_head_stride != 0 with identical broadcast mask rows.
+    std::vector<float> head_mask(8 * total_keys);
+    for (size_t h = 0; h < 8; ++h) {
+        std::copy(mask.begin(), mask.end(), head_mask.begin() + h * total_keys);
+    }
+    attention_f32_params gen_params = fast_params;
+    gen_params.mask_head_stride = total_keys;
+    ASSERT_EQ(attention_f32_work_items(gen_params), 8u);
+    std::vector<float> gen_scratch(attention_f32_scratch_size(gen_params));
+    std::vector<float> gen_out(8 * head_dim, -2.0f);
+    attention_f32(gen_params, query.data(), key.data(), value.data(), head_mask.data(), gen_out.data(), 0, 8,
+                  gen_scratch.data());
+
+    for (size_t i = 0; i < fast_out.size(); ++i) {
+        EXPECT_NEAR(fast_out[i], gen_out[i], 1e-5f);
+    }
 }
 
 TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
@@ -353,6 +379,81 @@ TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
       }
     }
   }
+}
+
+TEST(LlmCompositesTest, SymmetricLinearAndGatedMultiply) {
+    const size_t elems = 1037;
+    std::vector<float> gate(elems), up(elems), silu_out(elems, 0.0f), gelu_out(elems, 0.0f);
+    for (size_t i = 0; i < elems; ++i) {
+        gate[i] = 0.25f * static_cast<float>(static_cast<int>(i % 15) - 7);
+        up[i] = 0.15f * static_cast<float>(static_cast<int>(i % 11) - 5);
+    }
+    const size_t g_tiles = gated_multiply_tile_count(elems);
+    ASSERT_EQ(silu_multiply_tiles_f32(elems, gate.data(), up.data(), silu_out.data(), 0, g_tiles), ynn_status_success);
+    ASSERT_EQ(gelu_multiply_tiles_f32(elems, gate.data(), up.data(), gelu_out.data(), 0, g_tiles), ynn_status_success);
+    constexpr float kSqrt2OverPi = 0.79788456080286535588f;
+    for (size_t i = 0; i < elems; ++i) {
+        const float g = gate[i];
+        const float exp_silu = (g / (1.0f + std::exp(-g))) * up[i];
+        const float exp_gelu = 0.5f * g * (1.0f + std::tanh(kSqrt2OverPi * (g + 0.044715f * g * g * g))) * up[i];
+        EXPECT_NEAR(silu_out[i], exp_silu, 1e-4f);
+        EXPECT_NEAR(gelu_out[i], exp_gelu, 1e-4f);
+    }
+
+    for (int32_t bits : {2, 4, 8}) {
+        if (!is_symmetric_linear_supported(bits)) continue;
+        const size_t vals_per_byte = static_cast<size_t>(8 / bits);
+        const size_t n_cols = 37, k_cols = 72; // non-multiples of 32
+        const float in_scale = 0.125f, out_scale = 0.0625f;
+        std::vector<int8_t> w_unpacked(n_cols * k_cols);
+        std::vector<uint8_t> w_packed(n_cols * (k_cols / vals_per_byte), 0);
+        const int low = -(1 << (bits - 1));
+        const int span = 1 << bits;
+        const uint8_t mask = static_cast<uint8_t>(span - 1);
+        for (size_t r = 0; r < n_cols; ++r) {
+            for (size_t c = 0; c < k_cols; ++c) {
+                const int v = low + static_cast<int>((r * 13 + c * 7) % (span - 1)) + 1;
+                w_unpacked[r * k_cols + c] = static_cast<int8_t>(v);
+                const uint8_t code = static_cast<uint8_t>(v) & mask;
+                w_packed[r * (k_cols / vals_per_byte) + c / vals_per_byte] |=
+                    static_cast<uint8_t>(code << ((c % vals_per_byte) * bits));
+            }
+        }
+        std::vector<float> w_scales(n_cols);
+        for (size_t r = 0; r < n_cols; ++r) w_scales[r] = 0.0078125f * static_cast<float>((r % 5) + 1);
+
+        const size_t tiles = blockwise_linear_tile_count(n_cols);
+        std::vector<uint8_t> packed_buf(packed_symmetric_linear_size(bits, n_cols, k_cols, k_cols));
+        pack_symmetric_linear_tiles(bits, n_cols, k_cols, 0, k_cols, w_packed.data(), w_scales.data(), false, 0, tiles,
+                                    packed_buf.data());
+
+        for (size_t m_rows : {size_t{1}, size_t{5}}) {
+            std::vector<float> x(m_rows * k_cols);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = 0.125f * static_cast<float>(static_cast<int>(i % 17) - 8);
+            const size_t padded_k = symmetric_linear_padded_block(k_cols);
+            std::vector<int8_t> act_q(m_rows * padded_k);
+            std::vector<float> act_s(m_rows);
+            quantize_symmetric_blocks_f32(bits, m_rows, k_cols, k_cols, in_scale, x.data(), act_q.data(), act_s.data(),
+                                          0, m_rows);
+            std::vector<float> y(m_rows * n_cols, 0.0f);
+            symmetric_linear_f32(bits, m_rows, n_cols, k_cols, k_cols, out_scale, packed_buf.data(), act_q.data(),
+                                 act_s.data(), y.data(), n_cols, 0, tiles);
+
+            for (size_t m = 0; m < m_rows; ++m) {
+                for (size_t n = 0; n < n_cols; ++n) {
+                    int32_t dot = 0;
+                    for (size_t k = 0; k < k_cols; ++k) {
+                        const int32_t qx = static_cast<int32_t>(
+                            std::clamp(std::nearbyint(x[m * k_cols + k] / in_scale), -128.0f, 127.0f));
+                        dot += qx * static_cast<int32_t>(w_unpacked[n * k_cols + k]);
+                    }
+                    const float raw_y = static_cast<float>(dot) * (w_scales[n] * in_scale);
+                    const float ref = std::clamp(std::nearbyint(raw_y / out_scale), -128.0f, 127.0f) * out_scale;
+                    EXPECT_NEAR(y[m * n_cols + n], ref, 1e-5f) << "bits=" << bits << " m=" << m << " n=" << n;
+                }
+            }
+        }
+    }
 }
 
 }  // namespace

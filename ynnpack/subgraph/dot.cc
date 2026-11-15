@@ -1073,13 +1073,13 @@ std::tuple<index_t, index_t, index_t> choose_split_factors(index_t m, index_t n,
           const index_t m_tasks = std::max<index_t>(1, ceil_div(m, split_m));
           // Refine `split_n` when medium N leaves threads idle, down to `block_n`.
           while (split_n >= 2 * block_n && m_tasks * ceil_div(n, split_n) < max_threads) {
-              split_n = align_up<index_t>(split_n / 2, block_n);
+              split_n = ceil_div(split_n / 2, block_n) * block_n;
           }
           // Coarsen `split_n` on wide 1D GEMVs so Slinky dispatches ~4x threads slices instead of micro-tasks.
           if (m == 1 && split_k >= k) {
               const index_t target_tasks = max_threads * 4;
               if (ceil_div(n, split_n) > target_tasks) {
-                  split_n = std::max(split_n, align_up<index_t>(ceil_div(n, target_tasks), block_n));
+                  split_n = std::max(split_n, ceil_div(ceil_div(n, target_tasks), block_n) * block_n);
               }
           }
       }
