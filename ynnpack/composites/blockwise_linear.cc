@@ -131,23 +131,56 @@ __attribute__((target("dotprod"))) void store_row32_i8(
     (P) += 128;                                                                \
   } while (0)
 
-#define YNN_I4_DOT16x4_STEP(STEP, P, QE, QO, D)                              \
-  do {                                                                       \
-    for (size_t g = 0; g < 4; ++g) {                                         \
-      const int8x16_t raw =                                                  \
-          vld1q_s8(reinterpret_cast<const int8_t*>((P) + g * 16));           \
-      const int8x16_t we = vshrq_n_s8(vshlq_n_s8(raw, 4), 4),                \
-                      wo = vshrq_n_s8(raw, 4);                               \
-      (D)[0][g] = vdotq_laneq_s32(                                           \
-          vdotq_laneq_s32((D)[0][g], we, (QE)[0], STEP), wo, (QO)[0], STEP); \
-      (D)[1][g] = vdotq_laneq_s32(                                           \
-          vdotq_laneq_s32((D)[1][g], we, (QE)[1], STEP), wo, (QO)[1], STEP); \
-      (D)[2][g] = vdotq_laneq_s32(                                           \
-          vdotq_laneq_s32((D)[2][g], we, (QE)[2], STEP), wo, (QO)[2], STEP); \
-      (D)[3][g] = vdotq_laneq_s32(                                           \
-          vdotq_laneq_s32((D)[3][g], we, (QE)[3], STEP), wo, (QO)[3], STEP); \
-    }                                                                        \
+#define YNN_I4_DOT16xR_STEP(STEP, P, QE, QO, D, R)                             \
+  do {                                                                         \
+    for (size_t g = 0; g < 4; ++g) {                                           \
+      const int8x16_t raw =                                                    \
+          vld1q_s8(reinterpret_cast<const int8_t*>((P) + g * 16));             \
+      const int8x16_t we = vshrq_n_s8(vshlq_n_s8(raw, 4), 4),                  \
+                      wo = vshrq_n_s8(raw, 4);                                 \
+      for (size_t r = 0; r < (R); ++r)                                         \
+        (D)[r][g] = vdotq_laneq_s32(                                           \
+            vdotq_laneq_s32((D)[r][g], we, (QE)[r], STEP), wo, (QO)[r], STEP); \
+    }                                                                          \
   } while (0)
+
+template <size_t R, bool HAS_ZERO>
+__attribute__((target("dotprod,fp16"))) inline void eval_i4_block_rows(
+    size_t chunks, size_t G, size_t B, size_t b, size_t m0, size_t m,
+    const uint8_t* p_block, const int8_t* act_q, const float* act_scale,
+    const float* act_bsum, const float32x4_t ws[8], const float32x4_t wz[8],
+    float acc_buf[][32]) noexcept {
+  for (size_t half = 0; half < 2; ++half) {
+    int32x4_t d[R][4];
+    for (size_t r = 0; r < R; ++r)
+      for (size_t g = 0; g < 4; ++g) d[r][g] = vdupq_n_s32(0);
+    const uint8_t* p = p_block + half * 64;
+    for (size_t c = 0; c < chunks; ++c) {
+      int8x16_t qe[R], qo[R];
+      for (size_t r = 0; r < R; ++r) {
+        const int8_t* qp = act_q + ((m0 + m + r) * B + b) * G + c * 32;
+        qe[r] = vld1q_s8(qp + 0);
+        qo[r] = vld1q_s8(qp + 16);
+      }
+      YNN_I4_DOT16xR_STEP(0, p + 0 * 128, qe, qo, d, R);
+      YNN_I4_DOT16xR_STEP(1, p + 1 * 128, qe, qo, d, R);
+      YNN_I4_DOT16xR_STEP(2, p + 2 * 128, qe, qo, d, R);
+      YNN_I4_DOT16xR_STEP(3, p + 3 * 128, qe, qo, d, R);
+      p += 512;
+    }
+    for (size_t r = 0; r < R; ++r) {
+      const float as = act_scale[(m0 + m + r) * B + b];
+      for (size_t g = 0; g < 4; ++g) {
+        const size_t j = half * 4 + g;
+        float32x4_t a = vld1q_f32(acc_buf[m + r] + j * 4);
+        a = vfmaq_f32(a, vcvtq_f32_s32(d[r][g]), vmulq_n_f32(ws[j], as));
+        if constexpr (HAS_ZERO)
+          a = vfmaq_n_f32(a, wz[j], act_bsum[(m0 + m + r) * B + b]);
+        vst1q_f32(acc_buf[m + r] + j * 4, a);
+      }
+    }
+  }
+}
 
 template <size_t CHUNKS, bool HAS_ZERO>
 __attribute__((target("dotprod,fp16"))) void eval_i4_tile_32x1(
@@ -296,39 +329,20 @@ __attribute__((target("dotprod,fp16"))) void dispatch_i4_tiles(
             }
           }
         } else {
-          for (; m + 4 <= m_count; m += 4) {
-            for (size_t half = 0; half < 2; ++half) {
-              int32x4_t d[4][4];
-              for (size_t r = 0; r < 4; ++r)
-                for (size_t g = 0; g < 4; ++g) d[r][g] = vdupq_n_s32(0);
-              const uint8_t* p = p_block + half * 64;
-              for (size_t c = 0; c < chunks; ++c) {
-                int8x16_t qe[4], qo[4];
-                for (size_t r = 0; r < 4; ++r) {
-                  const int8_t* qp =
-                      act_q + ((m0 + m + r) * B + b) * G + c * 32;
-                  qe[r] = vld1q_s8(qp + 0);
-                  qo[r] = vld1q_s8(qp + 16);
-                }
-                YNN_I4_DOT16x4_STEP(0, p + 0 * 128, qe, qo, d);
-                YNN_I4_DOT16x4_STEP(1, p + 1 * 128, qe, qo, d);
-                YNN_I4_DOT16x4_STEP(2, p + 2 * 128, qe, qo, d);
-                YNN_I4_DOT16x4_STEP(3, p + 3 * 128, qe, qo, d);
-                p += 512;
-              }
-              for (size_t r = 0; r < 4; ++r) {
-                const float as = act_scale[(m0 + m + r) * B + b];
-                for (size_t g = 0; g < 4; ++g) {
-                  const size_t j = half * 4 + g;
-                  float32x4_t a = vld1q_f32(acc_buf[m + r] + j * 4);
-                  a = vfmaq_f32(a, vcvtq_f32_s32(d[r][g]),
-                                vmulq_n_f32(ws[j], as));
-                  if constexpr (HAS_ZERO)
-                    a = vfmaq_n_f32(a, wz[j], act_bsum[(m0 + m + r) * B + b]);
-                  vst1q_f32(acc_buf[m + r] + j * 4, a);
-                }
-              }
-            }
+          for (; m + 4 <= m_count; m += 4)
+            eval_i4_block_rows<4, HAS_ZERO>(chunks, G, B, b, m0, m, p_block,
+                                            act_q, act_scale, act_bsum, ws, wz,
+                                            acc_buf);
+          if (m + 3 <= m_count) {
+            eval_i4_block_rows<3, HAS_ZERO>(chunks, G, B, b, m0, m, p_block,
+                                            act_q, act_scale, act_bsum, ws, wz,
+                                            acc_buf);
+            m += 3;
+          } else if (m + 2 <= m_count) {
+            eval_i4_block_rows<2, HAS_ZERO>(chunks, G, B, b, m0, m, p_block,
+                                            act_q, act_scale, act_bsum, ws, wz,
+                                            acc_buf);
+            m += 2;
           }
         }
         for (; m < m_count; ++m) {
@@ -365,7 +379,7 @@ __attribute__((target("dotprod,fp16"))) void dispatch_i4_tiles(
 
 #undef YNN_I4_DOT32_STEP
 #undef YNN_I4_DOT32x2_STEP
-#undef YNN_I4_DOT16x4_STEP
+#undef YNN_I4_DOT16xR_STEP
 
 #define YNN_I8_DOT32_STEP(STEP, P, QA, D)             \
   do {                                                \
@@ -388,16 +402,41 @@ __attribute__((target("dotprod,fp16"))) void dispatch_i4_tiles(
     (D)[7] = vdotq_laneq_s32((D)[7], r7, (QA), STEP); \
   } while (0)
 
-#define YNN_I8_DOT16x4_STEP(STEP, P, QA, D)                      \
-  do {                                                           \
-    for (size_t g = 0; g < 4; ++g) {                             \
-      const int8x16_t rw = vld1q_s8((P) + g * 16);               \
-      (D)[0][g] = vdotq_laneq_s32((D)[0][g], rw, (QA)[0], STEP); \
-      (D)[1][g] = vdotq_laneq_s32((D)[1][g], rw, (QA)[1], STEP); \
-      (D)[2][g] = vdotq_laneq_s32((D)[2][g], rw, (QA)[2], STEP); \
-      (D)[3][g] = vdotq_laneq_s32((D)[3][g], rw, (QA)[3], STEP); \
-    }                                                            \
+#define YNN_I8_DOT16xR_STEP(STEP, P, QA, D, R)                     \
+  do {                                                             \
+    for (size_t g = 0; g < 4; ++g) {                               \
+      const int8x16_t rw = vld1q_s8((P) + g * 16);                 \
+      for (size_t r = 0; r < (R); ++r)                             \
+        (D)[r][g] = vdotq_laneq_s32((D)[r][g], rw, (QA)[r], STEP); \
+    }                                                              \
   } while (0)
+
+template <size_t R>
+__attribute__((target("dotprod"))) inline void eval_i8_kblock_rows(
+    size_t B, size_t b, size_t block_size, size_t k0, size_t k_len, size_t m0,
+    size_t m, const int8_t* p_sub, const int8_t* act_q,
+    int32_t d_buf[][32]) noexcept {
+  for (size_t half = 0; half < 2; ++half) {
+    int32x4_t d[R][4];
+    for (size_t r = 0; r < R; ++r)
+      for (size_t g = 0; g < 4; ++g)
+        d[r][g] = vld1q_s32(d_buf[m + r] + (half * 4 + g) * 4);
+    const int8_t* p = p_sub + half * 64;
+    for (size_t k = 0; k < k_len; k += 16) {
+      int8x16_t qa[R];
+      for (size_t r = 0; r < R; ++r)
+        qa[r] = vld1q_s8(act_q + ((m0 + m + r) * B + b) * block_size + k0 + k);
+      YNN_I8_DOT16xR_STEP(0, p + 0 * 128, qa, d, R);
+      YNN_I8_DOT16xR_STEP(1, p + 1 * 128, qa, d, R);
+      YNN_I8_DOT16xR_STEP(2, p + 2 * 128, qa, d, R);
+      YNN_I8_DOT16xR_STEP(3, p + 3 * 128, qa, d, R);
+      p += 512;
+    }
+    for (size_t r = 0; r < R; ++r)
+      for (size_t g = 0; g < 4; ++g)
+        vst1q_s32(d_buf[m + r] + (half * 4 + g) * 4, d[r][g]);
+  }
+}
 
 __attribute__((target("dotprod"))) void eval_i8_tile_32x1(
     size_t B, size_t block_size, const int8_t* p, const int8_t* qp,
@@ -464,28 +503,17 @@ __attribute__((target("dotprod"))) void dispatch_i8_tiles(
           const size_t k_len = std::min<size_t>(K_TILE, block_size - k0);
           const int8_t* p_sub = p_block + k0 * 32;
           size_t m = 0;
-          for (; m + 4 <= m_count; m += 4) {
-            for (size_t half = 0; half < 2; ++half) {
-              int32x4_t d[4][4];
-              for (size_t r = 0; r < 4; ++r)
-                for (size_t g = 0; g < 4; ++g)
-                  d[r][g] = vld1q_s32(d_buf[m + r] + (half * 4 + g) * 4);
-              const int8_t* p = p_sub + half * 64;
-              for (size_t k = 0; k < k_len; k += 16) {
-                int8x16_t qa[4];
-                for (size_t r = 0; r < 4; ++r)
-                  qa[r] = vld1q_s8(act_q + ((m0 + m + r) * B + b) * block_size +
-                                   k0 + k);
-                YNN_I8_DOT16x4_STEP(0, p + 0 * 128, qa, d);
-                YNN_I8_DOT16x4_STEP(1, p + 1 * 128, qa, d);
-                YNN_I8_DOT16x4_STEP(2, p + 2 * 128, qa, d);
-                YNN_I8_DOT16x4_STEP(3, p + 3 * 128, qa, d);
-                p += 512;
-              }
-              for (size_t r = 0; r < 4; ++r)
-                for (size_t g = 0; g < 4; ++g)
-                  vst1q_s32(d_buf[m + r] + (half * 4 + g) * 4, d[r][g]);
-            }
+          for (; m + 4 <= m_count; m += 4)
+            eval_i8_kblock_rows<4>(B, b, block_size, k0, k_len, m0, m, p_sub,
+                                   act_q, d_buf);
+          if (m + 3 <= m_count) {
+            eval_i8_kblock_rows<3>(B, b, block_size, k0, k_len, m0, m, p_sub,
+                                   act_q, d_buf);
+            m += 3;
+          } else if (m + 2 <= m_count) {
+            eval_i8_kblock_rows<2>(B, b, block_size, k0, k_len, m0, m, p_sub,
+                                   act_q, d_buf);
+            m += 2;
           }
           for (; m < m_count; ++m) {
             int32x4_t d0[8];
@@ -538,7 +566,7 @@ __attribute__((target("dotprod"))) void dispatch_i8_tiles(
 }
 
 #undef YNN_I8_DOT32_STEP
-#undef YNN_I8_DOT16x4_STEP
+#undef YNN_I8_DOT16xR_STEP
 #endif
 
 }  // namespace

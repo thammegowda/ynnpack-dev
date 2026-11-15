@@ -154,7 +154,8 @@ TEST(LlmCompositesTest, DequantizeEmbeddingVariants) {
   dequantize_embedding_f32(
       tokens.data(), tokens.size(), weights.data(), /*weights_bf16=*/false,
       /*packed_bits=*/4, /*unsigned_packed=*/false, width, groups,
-      scales.data(), /*scales_fp16=*/true, zeros.data(), /*zeros_fp16=*/true,
+      scales.data(),
+      /*scales_fp16=*/true, zeros.data(), /*zeros_fp16=*/true,
       /*multiplier=*/2.0f, out.data(), 0, tokens.size());
   for (size_t r = 0; r < tokens.size(); ++r) {
     const size_t tok = static_cast<size_t>(tokens[r]);
@@ -262,7 +263,8 @@ TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
             /*scales_fp16=*/false, has_zero ? zeros.data() : nullptr,
             /*zeros_fp16=*/false, 0, tiles, tiles_buf.data());
 
-        for (size_t M : {size_t{1}, size_t{35}}) {
+        for (size_t M :
+             {size_t{1}, size_t{2}, size_t{3}, size_t{4}, size_t{35}}) {
           std::vector<float> x(M * K);
           for (size_t i = 0; i < x.size(); ++i) {
             // Skewed positive range [-0.2, 3.4] exercises qd8 asymmetric
@@ -302,16 +304,20 @@ TEST(LlmCompositesTest, BlockwiseLinearInt4AndInt8) {
                   const float rdiff = rmax - rmin;
                   const float inv = rdiff > 0.0f ? 255.0f / rdiff : 0.0f;
                   a_scale = rdiff > 0.0f ? rdiff / 255.0f : 1.0f;
-                  const int32_t zp =
-                      rdiff > 0.0f
-                          ? static_cast<int32_t>(
-                                std::clamp(-rmin * inv, 0.0f, 255.0f) + 0.5f) -
-                                128
-                          : -128;
+                  int32_t zp = -128;
+                  if (rdiff > 0.0f) {
+                    const float min_error = -128.0f + rmin * inv;
+                    const float max_error = 127.0f + rmax * inv;
+                    const float fzp = min_error + max_error > 0.0f
+                                          ? -128.0f - rmin * inv
+                                          : 127.0f - rmax * inv;
+                    zp = static_cast<int32_t>(
+                        std::rint(std::clamp(fzp, -128.0f, 127.0f)));
+                  }
                   for (size_t k = 0; k < block_size; ++k) {
                     const int32_t qv = std::clamp<int32_t>(
-                        static_cast<int32_t>(std::nearbyint(
-                            x[(m * B + b) * block_size + k] * inv)) +
+                        static_cast<int32_t>(
+                            std::round(x[(m * B + b) * block_size + k] * inv)) +
                             zp,
                         -128, 127);
                     dot +=
