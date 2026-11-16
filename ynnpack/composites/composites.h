@@ -69,6 +69,8 @@ size_t attention_f32_work_items(const attention_f32_params& params);
 size_t attention_f32_scratch_size(const attention_f32_params& params);
 void attention_f32(const attention_f32_params& params, const float* query, const float* key, const float* value,
                    const float* mask, float* output, size_t item_start, size_t item_end, float* scratch);
+void attention_prefill_f32(const attention_f32_params& params, const float* query, const float* key, const float* value,
+                           const float* mask, float* output);
 
 bool is_blockwise_linear_supported(int32_t bits);
 size_t blockwise_linear_tile_count(size_t n);
@@ -99,6 +101,12 @@ void quantize_symmetric_blocks_f32(int32_t bits, size_t m, size_t k, size_t bloc
 void symmetric_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, float output_scale,
                           const void* packed_tiles, const int8_t* quantized_input, const float* input_scales,
                           float* output, size_t output_stride, size_t tile_start, size_t tile_end);
+void portable_packed_linear_unpack_weights(int32_t bits, const uint8_t* raw, size_t n, size_t k, size_t row_bytes,
+                                           int8_t* out);
+void portable_packed_linear_decode_meta(const void* meta, bool is_fp16, size_t count, float* out);
+void portable_packed_linear_f32(size_t rows, size_t n, size_t k, size_t block_size, float input_scale,
+                                float output_scale, bool has_zero, const float* x, const int8_t* w, const float* scales,
+                                const float* zeros, float* y, size_t row_start, size_t row_end);
 
 struct dense_linear_plan {
     ynn_type a_type = ynn_type_invalid;
@@ -154,6 +162,18 @@ void broadcast_binary_f32(bool is_multiply, size_t rank, const size_t* out_shape
                           size_t start, size_t end);
 void transpose_elements(size_t elem_bytes, size_t rank, const size_t* in_shape, const size_t* out_strides_elems,
                         const uint8_t* src, uint8_t* dst, size_t outer_start, size_t outer_end);
+void slice_blocks(size_t outer, size_t src_stride_bytes, size_t dst_stride_bytes, size_t offset_bytes, const void* src,
+                  void* dst, size_t begin, size_t end);
+void gather_elements(size_t elem_bytes, size_t axis_len, size_t inner, size_t index_count, bool idx_is_i64,
+                     const void* src, const void* indices, void* dst, size_t task_begin, size_t task_end);
+void scatter_rows(size_t batch_count, size_t dst_seq_len, size_t index_count, size_t row_bytes, const int32_t* indices,
+                  const void* src, void* dst);
+void broadcast_binary_i32(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int32_t* a, const int32_t* b,
+                          int32_t* out);
+void broadcast_binary_i64(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int64_t* a, const int64_t* b,
+                          int64_t* out);
 
 void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
                                    size_t row_count, size_t col_start, size_t col_count, uint8_t* destination);

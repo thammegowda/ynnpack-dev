@@ -15,8 +15,9 @@
 #include <cstring>
 #include <limits>
 #include <random>
-#include <thread>
 #include <vector>
+
+#include "ynnpack/base/thread_pool.h"
 
 namespace ynn {
 namespace {
@@ -102,18 +103,9 @@ TEST(HnswCompositesTest, DeterministicBuildAndThreadPoolParity) {
     EXPECT_EQ(last_progress, rows);
     EXPECT_TRUE(validate_hnsw_graph(g_single));
 
-    const hnsw_parallel_for_fn parallel_for = [](size_t task_count, std::function<void(size_t)> body) -> bool {
-        constexpr size_t kThreads = 4;
-        std::vector<std::thread> workers;
-        workers.reserve(kThreads);
-        for (size_t t = 0; t < kThreads; ++t) {
-            workers.emplace_back([&, t]() {
-                const size_t begin = (task_count * t) / kThreads;
-                const size_t end = (task_count * (t + 1)) / kThreads;
-                for (size_t i = begin; i < end; ++i) body(i);
-            });
-        }
-        for (auto& w : workers) w.join();
+    WorkerPool pool(3);
+    const hnsw_parallel_for_fn parallel_for = [&pool](size_t task_count, std::function<void(size_t)> body) -> bool {
+        pool.parallel_for(task_count, body);
         return true;
     };
     hnsw_graph g_threaded;

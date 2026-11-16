@@ -9,7 +9,6 @@ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 option(YNNPACK_BUILD_TESTS "Build YNNPACK unit tests" OFF)
 option(YNNPACK_BUILD_BENCHMARKS "Build YNNPACK benchmarks" OFF)
-option(YNNPACK_USE_SYSTEM_LIBS "Use installed dependencies where supported" OFF)
 if(EMSCRIPTEN OR YNNPACK_TARGET_PROCESSOR STREQUAL "wasm")
 	set(YNN_CPUINFO_DEFAULT OFF)
 else()

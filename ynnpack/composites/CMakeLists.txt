@@ -25,22 +25,12 @@ TARGET_LINK_LIBRARIES(ynnpack_composites PUBLIC
   ynnpack_kernels_transpose
   ynnpack_kernels_unary
 )
+IF(APPLE)
+  FIND_LIBRARY(YNN_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+  TARGET_COMPILE_DEFINITIONS(ynnpack_composites PRIVATE ACCELERATE_NEW_LAPACK)
+  TARGET_LINK_LIBRARIES(ynnpack_composites PRIVATE ${YNN_ACCELERATE_FRAMEWORK})
+ENDIF()
 
 IF(YNNPACK_BUILD_TESTS)
-  ADD_EXECUTABLE(ynnpack_composites_llm_test llm_composites_test.cc)
-  TARGET_LINK_LIBRARIES(ynnpack_composites_llm_test
-    ynnpack_composites
-    ynnpack_base
-    gtest
-    gtest_main
-  )
-  ADD_TEST(NAME ynnpack_composites_llm_test COMMAND ynnpack_composites_llm_test)
-
-  ADD_EXECUTABLE(ynnpack_composites_hnsw_test hnsw_test.cc)
-  TARGET_LINK_LIBRARIES(ynnpack_composites_hnsw_test
-    ynnpack_composites
-    gtest
-    gtest_main
-  )
-  ADD_TEST(NAME ynnpack_composites_hnsw_test COMMAND ynnpack_composites_hnsw_test)
+  ADD_SUBDIRECTORY(test)
 ENDIF()

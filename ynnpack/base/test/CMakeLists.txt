@@ -38,4 +38,12 @@ ADD_TEST(NAME ynnpack_float_test COMMAND ynnpack_float_test)
 ADD_EXECUTABLE(ynnpack_type_test type_test.cc)
 TARGET_LINK_LIBRARIES(ynnpack_type_test ynnpack_base gmock gtest gtest_main)
 ADD_TEST(NAME ynnpack_type_test COMMAND ynnpack_type_test)
+
+ADD_EXECUTABLE(ynnpack_thread_pool_test thread_pool_test.cc)
+TARGET_LINK_LIBRARIES(ynnpack_thread_pool_test ynnpack_base gtest gtest_main)
+ADD_TEST(NAME ynnpack_thread_pool_test COMMAND ynnpack_thread_pool_test)
+
+ADD_EXECUTABLE(ynnpack_topology_test topology_test.cc)
+TARGET_LINK_LIBRARIES(ynnpack_topology_test ynnpack_base gtest gtest_main)
+ADD_TEST(NAME ynnpack_topology_test COMMAND ynnpack_topology_test)
 ENDIF()

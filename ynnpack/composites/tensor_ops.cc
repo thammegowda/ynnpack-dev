@@ -1,7 +1,4 @@
-// Copyright 2026 Google LLC
-//
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree.
+// Licensed under the BSD-style license found in the LICENSE file in the root directory of this source tree.
 
 #include <algorithm>
 #include <cmath>
@@ -452,6 +449,73 @@ void transpose_elements(size_t elem_bytes, size_t rank, const size_t* in_shape, 
                 std::memcpy(dst + (dst_base + i * dst_inner_stride) * elem_bytes, sp + i * elem_bytes, elem_bytes);
             }
         }
+    }
+}
+
+void slice_blocks(size_t outer, size_t src_stride_bytes, size_t dst_stride_bytes, size_t offset_bytes, const void* src,
+                  void* dst, size_t begin, size_t end) {
+    end = std::min(end, outer);
+    const auto* s = static_cast<const uint8_t*>(src);
+    auto* d = static_cast<uint8_t*>(dst);
+    for (size_t b = begin; b < end; ++b) {
+        std::memcpy(d + b * dst_stride_bytes, s + b * src_stride_bytes + offset_bytes, dst_stride_bytes);
+    }
+}
+
+void gather_elements(size_t elem_bytes, size_t axis_len, size_t inner, size_t index_count, bool idx_is_i64,
+                     const void* src, const void* indices, void* dst, size_t task_begin, size_t task_end) {
+    const size_t slice_bytes = inner * elem_bytes;
+    const auto* s = static_cast<const uint8_t*>(src);
+    auto* d = static_cast<uint8_t*>(dst);
+    const auto* idx64 = static_cast<const int64_t*>(indices);
+    const auto* idx32 = static_cast<const int32_t*>(indices);
+    for (size_t task = task_begin; task < task_end; ++task) {
+        const size_t o = task / index_count;
+        const size_t j = task % index_count;
+        const size_t idx = static_cast<size_t>(idx_is_i64 ? idx64[j] : static_cast<int64_t>(idx32[j]));
+        std::memcpy(d + task * slice_bytes, s + (o * axis_len + idx) * slice_bytes, slice_bytes);
+    }
+}
+
+void scatter_rows(size_t batch_count, size_t dst_seq_len, size_t index_count, size_t row_bytes, const int32_t* indices,
+                  const void* src, void* dst) {
+    const auto* s = static_cast<const uint8_t*>(src);
+    auto* d = static_cast<uint8_t*>(dst);
+    for (size_t batch = 0; batch < batch_count; ++batch) {
+        for (size_t i = 0; i < index_count; ++i) {
+            std::memcpy(d + (batch * dst_seq_len + static_cast<size_t>(indices[i])) * row_bytes,
+                        s + (batch * index_count + i) * row_bytes, row_bytes);
+        }
+    }
+}
+
+void broadcast_binary_i32(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int32_t* a, const int32_t* b,
+                          int32_t* out) {
+    for (size_t idx = 0; idx < out_elements; ++idx) {
+        size_t rem = idx, a_off = 0, b_off = 0;
+        for (size_t d = rank; d-- > 0;) {
+            const size_t coord = rem % out_shape[d];
+            rem /= out_shape[d];
+            a_off += coord * a_strides[d];
+            b_off += coord * b_strides[d];
+        }
+        out[idx] = is_multiply ? (a[a_off] * b[b_off]) : (a[a_off] + b[b_off]);
+    }
+}
+
+void broadcast_binary_i64(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int64_t* a, const int64_t* b,
+                          int64_t* out) {
+    for (size_t idx = 0; idx < out_elements; ++idx) {
+        size_t rem = idx, a_off = 0, b_off = 0;
+        for (size_t d = rank; d-- > 0;) {
+            const size_t coord = rem % out_shape[d];
+            rem /= out_shape[d];
+            a_off += coord * a_strides[d];
+            b_off += coord * b_strides[d];
+        }
+        out[idx] = is_multiply ? (a[a_off] * b[b_off]) : (a[a_off] + b[b_off]);
     }
 }
 

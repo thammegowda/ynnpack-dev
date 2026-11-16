@@ -653,5 +653,128 @@ TEST(LlmCompositesTest, TensorOpsDirect) {
     }
 }
 
+TEST(LlmCompositesTest, RelocatedAttentionPrefill) {
+    const size_t batch = 1, rows = 3, heads = 4, kv_heads = 2, head_dim = 8, total_keys = 5, key_start = 1, key_len = 4;
+    std::vector<float> q(batch * rows * heads * head_dim);
+    std::vector<float> k(batch * total_keys * kv_heads * head_dim);
+    std::vector<float> v(batch * total_keys * kv_heads * head_dim);
+    std::vector<float> mask(rows * key_len, 0.0f);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = 0.1f * static_cast<float>(static_cast<int>(i % 9) - 4);
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = 0.07f * static_cast<float>(static_cast<int>(i % 7) - 3);
+        v[i] = 0.12f * static_cast<float>(static_cast<int>(i % 11) - 5);
+    }
+    mask[0 * key_len + 3] = -1e9f;
+    mask[1 * key_len + 3] = -1e9f;
+
+    const attention_f32_params params{
+        batch, rows, heads, kv_heads, key_start, key_len, total_keys, head_dim, 0, 0, 0, key_len, 1, 0.25f,
+    };
+    std::vector<float> prefill_out(q.size(), 0.0f);
+    std::vector<float> ref_out(q.size(), 0.0f);
+    std::vector<float> scratch(attention_f32_scratch_size(params));
+    attention_prefill_f32(params, q.data(), k.data(), v.data(), mask.data(), prefill_out.data());
+    attention_f32(params, q.data(), k.data(), v.data(), mask.data(), ref_out.data(), 0,
+                  attention_f32_work_items(params), scratch.data());
+    for (size_t i = 0; i < prefill_out.size(); ++i) {
+        EXPECT_NEAR(prefill_out[i], ref_out[i], 1e-5f);
+    }
+}
+
+TEST(LlmCompositesTest, RelocatedPortablePackedLinear) {
+    for (const int32_t bits : {2, 4, 8}) {
+        const size_t n = 3, k = 8, block_size = 4, blocks = k / block_size, vpb = static_cast<size_t>(8 / bits);
+        const size_t row_bytes = k / vpb;
+        std::vector<int8_t> w_ref(n * k);
+        std::vector<uint8_t> w_packed(n * row_bytes, 0);
+        const int low = -(1 << (bits - 1));
+        const int span = 1 << bits;
+        const uint8_t mask = static_cast<uint8_t>(span - 1);
+        for (size_t r = 0; r < n; ++r) {
+            for (size_t c = 0; c < k; ++c) {
+                const int val = low + static_cast<int>((r * 5 + c * 3) % span);
+                w_ref[r * k + c] = static_cast<int8_t>(val);
+                w_packed[r * row_bytes + c / vpb] |=
+                    static_cast<uint8_t>((static_cast<uint8_t>(val) & mask) << ((c % vpb) * bits));
+            }
+        }
+        std::vector<int8_t> w_unpacked(n * k);
+        portable_packed_linear_unpack_weights(bits, w_packed.data(), n, k, row_bytes, w_unpacked.data());
+        EXPECT_EQ(w_unpacked, w_ref);
+
+        std::vector<half> scales_fp16(n * blocks), zeros_fp16(n * blocks);
+        for (size_t i = 0; i < n * blocks; ++i) {
+            scales_fp16[i] = half(0.25f * static_cast<float>((i % 3) + 1));
+            zeros_fp16[i] = half(-0.125f * static_cast<float>(i % 2));
+        }
+        std::vector<float> scales(n * blocks), zeros(n * blocks);
+        portable_packed_linear_decode_meta(scales_fp16.data(), true, scales.size(), scales.data());
+        portable_packed_linear_decode_meta(zeros_fp16.data(), true, zeros.size(), zeros.data());
+
+        const std::vector<float> x = {0.5f,  -1.0f, 1.5f,  -0.5f, 0.25f, 0.75f,  -0.25f, 1.0f,
+                                      -1.0f, 0.5f,  -0.5f, 1.5f,  1.0f,  -0.25f, 0.5f,   -0.75f};
+        std::vector<float> out(2 * n, 0.0f);
+        portable_packed_linear_f32(2, n, k, block_size, /*input_scale=*/0.25f, /*output_scale=*/0.0f,
+                                   /*has_zero=*/true, x.data(), w_unpacked.data(), scales.data(), zeros.data(),
+                                   out.data(), 0, 2);
+        for (size_t m = 0; m < 2; ++m) {
+            for (size_t r = 0; r < n; ++r) {
+                float expected = 0.0f;
+                for (size_t b = 0; b < blocks; ++b) {
+                    int32_t dot = 0;
+                    float bsum = 0.0f;
+                    for (size_t c = 0; c < block_size; ++c) {
+                        const float xv = x[m * k + b * block_size + c];
+                        bsum += xv;
+                        const int32_t qx =
+                            static_cast<int32_t>(std::clamp(std::nearbyint(xv / 0.25f), -128.0f, 127.0f));
+                        dot += qx * static_cast<int32_t>(w_ref[r * k + b * block_size + c]);
+                    }
+                    expected += static_cast<float>(dot) * 0.25f * scales[r * blocks + b] + bsum * zeros[r * blocks + b];
+                }
+                EXPECT_NEAR(out[m * n + r], expected, 1e-4f);
+            }
+        }
+    }
+}
+
+TEST(LlmCompositesTest, RelocatedDataMovementAndIntBinary) {
+    // slice_blocks
+    const std::vector<float> src = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    std::vector<float> sliced(4, 0.0f);
+    slice_blocks(2, 4 * sizeof(float), 2 * sizeof(float), 1 * sizeof(float), src.data(), sliced.data(), 0, 2);
+    EXPECT_EQ(sliced, (std::vector<float>{2.0f, 3.0f, 6.0f, 7.0f}));
+
+    // gather_elements (i32 and i64)
+    const std::vector<int32_t> idx32 = {2, 0};
+    std::vector<float> gathered(4, 0.0f);
+    gather_elements(sizeof(float), 4, 1, 2, false, src.data(), idx32.data(), gathered.data(), 0, 4);
+    EXPECT_EQ(gathered, (std::vector<float>{3.0f, 1.0f, 7.0f, 5.0f}));
+    const std::vector<int64_t> idx64 = {3, 1};
+    gather_elements(sizeof(float), 4, 1, 2, true, src.data(), idx64.data(), gathered.data(), 0, 4);
+    EXPECT_EQ(gathered, (std::vector<float>{4.0f, 2.0f, 8.0f, 6.0f}));
+
+    // scatter_rows
+    std::vector<float> cache(8, 0.0f);
+    const std::vector<float> updates = {10.0f, 20.0f, 30.0f, 40.0f};
+    const std::vector<int32_t> sc_idx = {2, 0};
+    scatter_rows(2, 4, 2, sizeof(float), sc_idx.data(), updates.data(), cache.data());
+    EXPECT_EQ(cache, (std::vector<float>{20.0f, 0.0f, 10.0f, 0.0f, 40.0f, 0.0f, 30.0f, 0.0f}));
+
+    // broadcast_binary_i32 & broadcast_binary_i64
+    const std::array<size_t, 2> out_shape{2, 3}, a_strides{3, 1}, b_strides{0, 1};
+    const std::vector<int32_t> a32 = {1, 2, 3, 4, 5, 6}, b32 = {10, 20, 30};
+    std::vector<int32_t> out32(6);
+    broadcast_binary_i32(false, 2, out_shape.data(), a_strides.data(), b_strides.data(), 6, a32.data(), b32.data(),
+                         out32.data());
+    EXPECT_EQ(out32, (std::vector<int32_t>{11, 22, 33, 14, 25, 36}));
+
+    const std::vector<int64_t> a64 = {2, 3, 4, 5, 6, 7}, b64 = {10, 100, 1000};
+    std::vector<int64_t> out64(6);
+    broadcast_binary_i64(true, 2, out_shape.data(), a_strides.data(), b_strides.data(), 6, a64.data(), b64.data(),
+                         out64.data());
+    EXPECT_EQ(out64, (std::vector<int64_t>{20, 300, 4000, 50, 600, 7000}));
+}
+
 } // namespace
 } // namespace ynn

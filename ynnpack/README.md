@@ -1,8 +1,9 @@
 ## YNNPACK
 
-> This ynnpack-dev extraction omits the XNNPACK compatibility layer and Bazel
-> metadata. See the [project README](../README.md) for provenance and build
-> instructions.
+> This ynnpack-dev extraction is tailor-made for
+> [Kidi](https://github.com/thammegowda/kidi) and omits the XNNPACK
+> compatibility layer and Bazel metadata. See the [project README](../README.md)
+> for provenance and build instructions.
 
 YNNPACK is a work-in-progress spiritual successor to XNNPACK. It uses many ideas
 and principles from XNNPACK, but is otherwise a near total rewrite. This
@@ -10,58 +11,30 @@ document will focus on the differences from XNNPACK.
 
 ### Architecture
 
-XNNPACK is structured into roughly 3 top level layers:
-1. Subgraph API (`xnn_define_...`)
-2. Operator API (`xnn_create_...`, `xnn_reshape_...`, `xnn_setup_...`,
-`xnn_run_operator`)
-3. Microkernels
+Upstream YNNPACK uses two primary layers:
+1. A subgraph IR (`ynn_define_...`) lowered and scheduled through Slinky
+2. Generated and templated microkernels
 
-The subgraph API uses the operator API, which in turn calls microkernels.
+In `ynnpack-dev`, the `subgraph/` compiler and Slinky runtime were intentionally
+removed because all design decisions in this fork prioritize
+[Kidi](https://github.com/thammegowda/kidi). Kidi already owns the high-level
+tensor/operator graph, arena memory management, replay capture, and thread-pool
+scheduling, so running a second subgraph optimizer and Slinky loop engine
+underneath Kidi added graph-build latency, duplicate scheduling overhead, and
+suboptimal retiling without improving inference performance.
 
-YNNPACK has (1) and (3) from above, but does not have an explicit operator API.
-YNNPACK uses [slinky](https://github.com/dsharlet/slinky) to execute the loops
-that exist outside the microkernels, which was the role of the operator API in
-XNNPACK. More importantly, most of the work that the operator API in XNNPACK
-performed has been moved into subgraph nodes, e.g. packing weights is handled by
-a subgraph node (that may or may not get constant folded).
-
-XNNPACK would run these loops for each operator one at a time, unless they were
-explicitly manually fused into a microkernel or the appropriate
-`xnn_compute_...` function.
-
-Slinky optimizes these loops by finding and fusing loops across many subgraph
-nodes, which improves memory locality, eliminates synchronization points when
-parallelizing, and both adds and removes overhead (hopefully removes more than
-it adds).
-
-### Operator design
-
-XNNPACK can be thought of as a more "CISC" and YNNPACK a more "RISC" design.
-Instead of requiring a specialized operator for every higher-level computation,
-YNNPACK provides composable building blocks such as padding, stencil copies, and
-reductions.
-
-This approach may seem like it would offer lower performance, but many of the
-building blocks used to implement such operations are usually low or zero cost
-due to Slinky optimizations, and this approach offers much more flexibility to
-implement a wider variety of operations with less runtime-specific machinery.
-
-To enable good performance, our strategy is to express as much work as possible
-as standard subgraph logic (which does not require changes in YNNPACK itself),
-and then add necessary optimizations to the subgraph to make it perform well.
-Tactics to improve good performance are in order of preference:
-
-- Improve Slinky and/or YNNPACK to execute subgraph operations with good
-  locality and minimal overhead. This is preferred because these improvements
-  generalize very well and should benefit a wide variety of use cases.
-- Optimize the subgraph itself, e.g. fusing common or critical combinations of
-  nodes into one optimized implementation. This may or may not involve adding a
-  new kernel.
-- Add a new kind of subgraph node to the public API. This should be rare.
-
-The goal is for subgraph performance optimizations to apply broadly to many use
-cases. Optimizations that apply narrowly to a specific use case are a "design
-smell".
+Instead, `ynnpack-dev` exposes two clean low-level layers:
+1. **Microkernels (`kernels/`)**: Generated and C++-templated SIMD/matrix
+   kernels (NEON, DotProd, I8MM, SME/SME2, AVX2/AVX512/AMX, Wasm, etc.) plus
+   kernel scheduling/packing helpers (`get_dot_kernel`, `packer`, `schedule_dot`,
+   `run_dot`, unary/binary/reduce/transpose dispatch).
+2. **Direct Composites (`composites/`)**: Stateless, range-parallel C++20
+   (`-fno-rtti`) primitives built directly on `kernels/`—such as dense/quantized
+   linear, blockwise/symmetric low-bit linear and fused FFN, flash and INT8
+   quantized attention, RMSNorm/LayerNorm/Softmax, rotary, gated activations,
+   elementwise/cast/transpose ops, and HNSW search/build microkernels. Calling
+   them over explicit tile/row ranges lets the host runtime (Kidi) drive work
+   directly on its own `WorkerPool` with zero Slinky or subgraph overhead.
 
 ### Kernel design
 
@@ -88,39 +61,17 @@ Kernels are currently generated in a few different ways:
 
 ### Code organization
 
-- `base/`: Basic utilities used throughout the rest of the library.
-- `include/ynnpack.h`: The public API
-- `kernels/`: Low level kernels implementing the basic building blocks of
-  computations expressible by YNNPACK.
-- `subgraph/`: Implementation of the public API, using `kernels/`.
-
-### Status
-
-YNNPACK is useful for selected inference workloads, but remains a work in
-progress. It offers significant performance advantages in some cases, but can
-regress or lack functionality in others. An incomplete list of gaps is:
-
-- Major operations and optimized lowering paths are still missing.
-- Some features may be implemented, but have poor performance due to
-  not-yet-done optimization work.
-- Code size, in particular the
-  [simplifier in Slinky](https://github.com/dsharlet/slinky/issues/727).
-- Initialization time can be large due to subgraph processing cost. There is a
-  lot of low hanging fruit in this area:
-  - A lot of redundant work in simplification in Slinky
-  - Use better data structures/algorithms (e.g. replace std::vector with small
-    bounded size arrays for rank data).
-  - Basic compiler optimization techniques apply to Slinky, e.g. arena
-    allocating expressions.
-  - Find a way to cut down the massive redundancy in models (e.g. subgraph
-    "outlining"?)
-- Many ARM kernels exist, but so far most attention has been on x86 kernels.
-
-As this is very much a work in progress, any comments, suggestions, or
-contributions are welcome.
+- `base/`: Basic utilities (`arch`, `type`, standalone C++17 `span`, float/BF16/FP16/FP8 helpers, SIMD wrappers) used throughout the library.
+- `include/ynnpack.h`: Shared status codes, data types, and operator enums.
+- `kernels/`: Low-level kernels implementing the core SIMD and matrix building blocks.
+- `composites/`: Direct, range-parallel C++20 (`-fno-rtti`) composite kernels over `kernels/` and `base/`, with no graph IR or thread-pool dependency.
+- `cuda/`: CUDA execution backend.
 
 ### Goals
 
-ynnpack-dev focuses on the YNNPACK public API and optimized CPU execution for
-inference workloads. It can add purpose-built transformer operations without
-requiring XNNPACK operator or ABI compatibility.
+`ynnpack-dev` is tailor-made for [Kidi](https://github.com/thammegowda/kidi),
+with API, kernel, and architecture choices made to improve Kidi. It focuses on
+low-level CPU/CUDA kernels, composites, and standalone microbenchmarks/tests
+without graph IR compilation, Slinky lowering, or XNNPACK ABI compatibility,
+while high-level model graphs, tensor memory arenas, and thread-pool scheduling
+live in Kidi.
