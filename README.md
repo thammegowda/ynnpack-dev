@@ -1,11 +1,26 @@
 # ynnpack-dev
 
 ynnpack-dev is a standalone development fork of
-[YNNPACK](https://github.com/google/XNNPACK/tree/78d255d4d6455f0249cfdd229756ee90e476e317/ynnpack).
-It retains YNNPACK's graph compiler, Slinky lowering, composites, tests, benchmarks,
-and generated CPU kernels while omitting the XNNPACK compatibility layer and
-Bazel-only metadata. Its API may evolve independently, including adding selected
-XNNPACK compatibility where useful.
+[YNNPACK](https://github.com/google/XNNPACK/tree/78d255d4d6455f0249cfdd229756ee90e476e317/ynnpack),
+**tailor-made for [Kidi](https://github.com/thammegowda/kidi)** as its low-level
+CPU/CUDA kernel and composite backend. Architectural, API, and kernel decisions
+in this fork are driven directly by what makes Kidi faster, leaner, and simpler.
+
+Unlike upstream YNNPACK, `ynnpack-dev` removes the `ynnpack/subgraph` graph
+compiler and the [Slinky](https://github.com/dsharlet/slinky) loop-lowering
+runtime. [Kidi](https://github.com/thammegowda/kidi) already owns the high-level
+operator graph, tensor lifetime/arena management, step replay, and thread-pool
+scheduling (`WorkerPool`), so keeping a second graph IR and Slinky
+JIT/scheduler in YNNPACK added compile latency, dispatch overhead, and
+scheduling complexity without helping inference speed. `ynnpack-dev` instead
+exposes direct, stateless C++20 (`-fno-rtti`) kernels and composites that
+Kidi's runtime invokes directly over its own worker pool.
+
+It retains YNNPACK's generated CPU microkernels, `base/` utilities,
+`composites/` (dense/quantized/blockwise linear, flash/quantized attention,
+RMSNorm, rotary, gated activations, HNSW, elementwise/tensor ops), CUDA
+execution backend, tests, and benchmarks, while omitting the XNNPACK
+compatibility layer and Bazel-only metadata.
 
 ## Origin and credits
 
@@ -56,16 +71,14 @@ git submodule update --init --recursive
 
 | Dependency | Purpose | License |
 | --- | --- | --- |
-| [Slinky](https://github.com/dsharlet/slinky) | Loop lowering, scheduling, and execution | [MIT](third_party/slinky/LICENSE) |
 | [cpuinfo](https://github.com/pytorch/cpuinfo) | Runtime CPU feature detection | [BSD 2-Clause](third_party/cpuinfo/LICENSE) |
 | [GoogleTest](https://github.com/google/googletest) | Unit tests | [BSD 3-Clause](third_party/googletest/LICENSE) |
 | [Google Benchmark](https://github.com/google/benchmark) | Microbenchmarks | [Apache 2.0](third_party/benchmark/LICENSE) |
 
-Slinky and cpuinfo support the default library build. GoogleTest and Google
+`cpuinfo` supports the default library build. GoogleTest and Google
 Benchmark are added only when their corresponding build options are enabled.
-An embedding project may provide compatible `slinky_base` or `cpuinfo` targets
-before adding this project; `YNNPACK_USE_SYSTEM_LIBS=ON` selects an installed
-Slinky package.
+An embedding project may provide a compatible `cpuinfo` target before adding
+this project.
 
 Python 3.10 or newer is required at build time to generate architecture-specific
 kernels. The generators use only the Python standard library.
@@ -85,17 +98,12 @@ cmake --build build-test
 ctest --test-dir build-test --output-on-failure
 ```
 
-Native builds register dot cases individually so CTest can run them in parallel
-without shortening their five-second fuzz budgets. To run just these cases with
-eight workers:
+To run just the composite suites (dense/quantized linear, attention,
+blockwise/symmetric FFN, HNSW, elementwise/normalization):
 
 ```sh
-ctest --test-dir build-test --parallel 8 --output-on-failure -R '^ynnpack_subgraph_dot_test'
+ctest --test-dir build-test --output-on-failure -R '^ynnpack_composites_'
 ```
-
-Cross-compiled builds retain a single dot test entry to avoid executing target
-binaries during test discovery. CI already selects parallelism from the runner's
-CPU count.
 
 Add `-DYNNPACK_BUILD_BENCHMARKS=ON` to build the microbenchmarks.
 
@@ -108,10 +116,11 @@ add_subdirectory(third_party/ynnpack-dev EXCLUDE_FROM_ALL)
 target_link_libraries(my_app PRIVATE ynnpack ynnpack_composites)
 ```
 
-`ynnpack` exports the public and source-root include paths. Link
-`ynnpack_composites` as well when using its higher-level graph builders.
-Python discovery, Slinky, and CPU feature detection are managed by the library;
-no custom cpuinfo target or private include path is needed on Apple Silicon.
+`ynnpack` exports the public and source-root include paths and links `base/`
+plus the `kernels/` libraries. Link `ynnpack_composites` as well when using its
+direct C++20 operator composites. Python discovery and CPU feature detection are
+managed by the library; no custom cpuinfo target or private include path is
+needed on Apple Silicon.
 
 Tests and benchmarks default to OFF. Native builds default to bundled cpuinfo;
 Emscripten builds select Wasm kernels and default cpuinfo to OFF. ARM64 FP8,

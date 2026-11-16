@@ -89,20 +89,20 @@ void quantized_attention_prefill_f32(const quantized_attention_f32_params& param
     const size_t heads_per_group = params.query_heads / params.key_value_heads;
     const size_t key_sequence_stride = params.key_value_heads * params.head_dim;
     float* query_tile = score_data + heads_per_group * params.key_length;
-    const auto normalize = [&](float* scores) {
+    const auto normalize = [&](float* scores, size_t active_keys) {
         float maximum = -std::numeric_limits<float>::infinity();
-        for (size_t token = 0; token < params.key_length; ++token) {
+        for (size_t token = 0; token < active_keys; ++token) {
             maximum = std::max(maximum, scores[token]);
         }
-        for (size_t token = 0; token < params.key_length; ++token) {
+        for (size_t token = 0; token < active_keys; ++token) {
             scores[token] -= maximum;
         }
-        exp_kernel(1, params.key_length, params.key_length * sizeof(float), scores, params.key_length * sizeof(float),
-                   scores, &exp_params);
+        exp_kernel(1, active_keys, active_keys * sizeof(float), scores, active_keys * sizeof(float), scores,
+                   &exp_params);
         float exponential_sum = 0.0f;
-        sum_kernel(1, params.key_length, params.key_length * sizeof(float), scores, &exponential_sum, nullptr);
+        sum_kernel(1, active_keys, active_keys * sizeof(float), scores, &exponential_sum, nullptr);
         const float inverse_sum = exponential_sum == 0.0f ? 0.0f : 1.0f / exponential_sum;
-        for (size_t token = 0; token < params.key_length; ++token) {
+        for (size_t token = 0; token < active_keys; ++token) {
             scores[token] *= inverse_sum;
         }
     };
@@ -119,6 +119,19 @@ void quantized_attention_prefill_f32(const quantized_attention_f32_params& param
         const size_t first_query_head = key_value_head * heads_per_group;
         const size_t key_base = key_batch * params.key_batch_stride + key_value_head * params.head_dim;
 
+        size_t active_keys = params.key_length;
+        if (mask != nullptr && params.mask_head_stride == 0) {
+            const float* row_mask = mask + batch * params.mask_batch_stride + query_index * params.mask_query_stride;
+            while (active_keys > 0 && row_mask[(active_keys - 1) * params.mask_key_stride] <= -1e8f) {
+                --active_keys;
+            }
+        }
+        float* output_data = output + (query_row * params.query_heads + first_query_head) * params.head_dim;
+        if (active_keys == 0) {
+            std::fill(output_data, output_data + heads_per_group * params.head_dim, 0.0f);
+            continue;
+        }
+
         for (size_t channel = 0; channel < params.head_dim; ++channel) {
             for (size_t group_head = 0; group_head < heads_per_group; ++group_head) {
                 query_tile[channel * heads_per_group + group_head] =
@@ -126,7 +139,7 @@ void quantized_attention_prefill_f32(const quantized_attention_f32_params& param
             }
         }
 
-        for (size_t token = 0; token < params.key_length; ++token) {
+        for (size_t token = 0; token < active_keys; ++token) {
             const size_t key_offset = key_base + (params.key_start + token) * key_sequence_stride;
             float scores[MAX_HEADS_PER_GROUP]{};
 #if defined(__ARM_NEON)
@@ -169,17 +182,16 @@ void quantized_attention_prefill_f32(const quantized_attention_f32_params& param
                     score += mask[batch * params.mask_batch_stride + query_head * params.mask_head_stride +
                                   query_index * params.mask_query_stride + token * params.mask_key_stride];
                 }
-                score_data[group_head * params.key_length + token] = score;
+                score_data[group_head * active_keys + token] = score;
             }
         }
 
         for (size_t group_head = 0; group_head < heads_per_group; ++group_head) {
-            normalize(score_data + group_head * params.key_length);
+            normalize(score_data + group_head * active_keys, active_keys);
         }
 
-        float* output_data = output + (query_row * params.query_heads + first_query_head) * params.head_dim;
         std::fill(output_data, output_data + heads_per_group * params.head_dim, 0.0f);
-        for (size_t token = 0; token < params.key_length; ++token) {
+        for (size_t token = 0; token < active_keys; ++token) {
             const size_t value_offset = key_base + (params.key_start + token) * key_sequence_stride;
             for (size_t block = 0; block < block_count(params.head_dim, params.value_quantization); ++block) {
                 const size_t channel_start = block * params.value_quantization.block_size;
@@ -187,7 +199,7 @@ void quantized_attention_prefill_f32(const quantized_attention_f32_params& param
                     std::min(params.head_dim, channel_start + params.value_quantization.block_size);
                 accumulate_grouped_value(channel_end - channel_start, value + value_offset + channel_start,
                                          params.value_quantization.zero_points[block],
-                                         params.value_quantization.scales[block], score_data + token, params.key_length,
+                                         params.value_quantization.scales[block], score_data + token, active_keys,
                                          heads_per_group, output_data + channel_start, params.head_dim);
             }
         }

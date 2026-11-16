@@ -8,15 +8,24 @@
 // LICENSES/llama.cpp.txt.
 
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/base/thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+#if defined(__APPLE__)
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
 #endif
 
 namespace ynn {
@@ -207,8 +216,8 @@ void compute_row(const quantized_attention_f32_params& params, const float* quer
                     const int32_t dot = dot_i8(channel_end - channel_start, quantized_query + channel_start,
                                                key + key_offset + channel_start, query_zero_points[query_block],
                                                params.key_quantization.zero_points[key_block]);
-                    score += static_cast<float>(dot) * query_scales[query_block] *
-                             params.key_quantization.scales[key_block];
+                    score +=
+                        static_cast<float>(dot) * query_scales[query_block] * params.key_quantization.scales[key_block];
                     channel_start = channel_end;
                 }
             }
@@ -231,8 +240,8 @@ void compute_row(const quantized_attention_f32_params& params, const float* quer
                 const size_t channel_end =
                     std::min(params.head_dim, channel_start + params.value_quantization.block_size);
                 accumulate_value(channel_end - channel_start, value + value_offset + channel_start,
-                                 params.value_quantization.zero_points[block],
-                                 params.value_quantization.scales[block], weight, output + channel_start);
+                                 params.value_quantization.zero_points[block], params.value_quantization.scales[block],
+                                 weight, output + channel_start);
             }
             sum = sum * output_scale + weight;
         }
@@ -276,6 +285,372 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
     for (size_t row = row_start; row < row_end; ++row) {
         float* output_data = output + row * params.head_dim;
         compute_row(params, query, key, value, mask, row, output_data, scratch);
+    }
+}
+
+namespace {
+
+float dot_f32_lanes8(const float* left, const float* right, size_t count) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    size_t index = 0;
+#if defined(__ARM_NEON)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    for (; index + 8 <= count; index += 8) {
+        acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(left + index), vld1q_f32(right + index)));
+        acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(left + index + 4), vld1q_f32(right + index + 4)));
+    }
+    float lanes[8];
+    vst1q_f32(lanes, acc0);
+    vst1q_f32(lanes + 4, acc1);
+#else
+    float lanes[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (; index + 8 <= count; index += 8) {
+        for (size_t lane = 0; lane < 8; ++lane) {
+            lanes[lane] += left[index + lane] * right[index + lane];
+        }
+    }
+#endif
+    float sum = 0.0f;
+    for (size_t lane = 0; lane < 8; ++lane) sum += lanes[lane];
+    for (; index < count; ++index) sum += left[index] * right[index];
+    return sum;
+}
+
+inline void accumulate_weighted_f32(float* dst, const float* src, float weight, size_t count) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    size_t index = 0;
+#if defined(__ARM_NEON)
+    const float32x4_t vw = vdupq_n_f32(weight);
+    for (; index + 8 <= count; index += 8) {
+        vst1q_f32(dst + index, vaddq_f32(vld1q_f32(dst + index), vmulq_f32(vld1q_f32(src + index), vw)));
+        vst1q_f32(dst + index + 4, vaddq_f32(vld1q_f32(dst + index + 4), vmulq_f32(vld1q_f32(src + index + 4), vw)));
+    }
+#endif
+    for (; index < count; ++index) dst[index] += weight * src[index];
+}
+
+bool is_single_gqa8_step(const attention_f32_params& params) {
+    return params.batch_size == 1 && params.query_length == 1 && params.key_value_heads == 1 &&
+           params.query_heads == 8 && params.mask_head_stride == 0;
+}
+
+} // namespace
+
+size_t attention_f32_work_items(const attention_f32_params& params) {
+    if (is_single_gqa8_step(params)) return 4;
+    return params.batch_size * params.query_length * params.query_heads;
+}
+
+size_t attention_f32_scratch_size(const attention_f32_params& params) {
+    const size_t keys = params.key_length ? params.key_length : params.total_keys;
+    return (is_single_gqa8_step(params) ? 2 : 1) * keys;
+}
+
+void attention_f32(const attention_f32_params& params, const float* query, const float* key_data,
+                   const float* value_data, const float* mask, float* output_data, size_t item_start, size_t item_end,
+                   float* scratch) {
+    if (params.query_heads == 0 || params.key_value_heads == 0 || params.query_heads % params.key_value_heads != 0) {
+        return;
+    }
+    const size_t rows = params.query_length;
+    const size_t heads = params.query_heads;
+    const size_t key_heads = params.key_value_heads;
+    const size_t head_width = params.head_dim;
+    const size_t width = heads * head_width;
+    const size_t kv_width = key_heads * head_width;
+    const size_t group_size = heads / key_heads;
+    const size_t keys = params.key_length ? params.key_length : params.total_keys;
+
+    if (is_single_gqa8_step(params)) {
+        item_end = std::min<size_t>(item_end, 4);
+        if (item_start >= item_end) return;
+        const float* k_base = key_data + params.key_start * head_width;
+        const float* v_base = value_data + params.key_start * head_width;
+        size_t active_keys = keys;
+        if (mask != nullptr) {
+            while (active_keys > 0 && mask[(active_keys - 1) * params.mask_key_stride] <= -1e8f) --active_keys;
+        }
+        for (size_t item = item_start; item < item_end; ++item) {
+            const size_t h_begin = item * 2;
+            if (active_keys == 0) {
+                std::fill_n(output_data + h_begin * head_width, 2 * head_width, 0.0f);
+                continue;
+            }
+            float largest0 = -std::numeric_limits<float>::infinity();
+            float largest1 = -std::numeric_limits<float>::infinity();
+            float* scores0 = scratch;
+            float* scores1 = scratch + active_keys;
+            const float* q0 = query + h_begin * head_width;
+            const float* q1 = q0 + head_width;
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+                if (b <= -1e8f) {
+                    scores0[k_idx] = -std::numeric_limits<float>::infinity();
+                    scores1[k_idx] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                const float* k_row = k_base + k_idx * head_width;
+                const float s0 = dot_f32_lanes8(q0, k_row, head_width) * params.scale + b;
+                const float s1 = dot_f32_lanes8(q1, k_row, head_width) * params.scale + b;
+                scores0[k_idx] = s0;
+                scores1[k_idx] = s1;
+                largest0 = std::max(largest0, s0);
+                largest1 = std::max(largest1, s1);
+            }
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                scores0[k_idx] = scores0[k_idx] == -std::numeric_limits<float>::infinity()
+                                     ? 0.0f
+                                     : std::exp(scores0[k_idx] - largest0);
+                scores1[k_idx] = scores1[k_idx] == -std::numeric_limits<float>::infinity()
+                                     ? 0.0f
+                                     : std::exp(scores1[k_idx] - largest1);
+                total0 += scores0[k_idx];
+                total1 += scores1[k_idx];
+            }
+            const float inv_total0 = 1.0f / total0;
+            const float inv_total1 = 1.0f / total1;
+            float* out0 = output_data + h_begin * head_width;
+            float* out1 = out0 + head_width;
+            std::fill_n(out0, 2 * head_width, 0.0f);
+            for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+                const float b = mask != nullptr ? mask[k_idx * params.mask_key_stride] : 0.0f;
+                if (b <= -1e8f) continue;
+                const float* v_row = v_base + k_idx * head_width;
+                accumulate_weighted_f32(out0, v_row, scores0[k_idx] * inv_total0, head_width);
+                accumulate_weighted_f32(out1, v_row, scores1[k_idx] * inv_total1, head_width);
+            }
+        }
+        return;
+    }
+
+    const size_t items = params.batch_size * rows * heads;
+    item_end = std::min(item_end, items);
+    for (size_t item = item_start; item < item_end; ++item) {
+        const size_t row = item % rows;
+        const size_t head = (item / rows) % heads;
+        const size_t sample = item / (rows * heads);
+        const size_t kv_head = head / group_size;
+        const float* q = query + (sample * rows + row) * width + head * head_width;
+        const float* k =
+            key_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* v =
+            value_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* bias = mask != nullptr ? mask + sample * params.mask_batch_stride +
+                                                  head * params.mask_head_stride + row * params.mask_query_stride
+                                            : nullptr;
+        size_t active_keys = keys;
+        if (bias != nullptr) {
+            while (active_keys > 0 && bias[(active_keys - 1) * params.mask_key_stride] <= -1e8f) --active_keys;
+        }
+        if (active_keys == 0) {
+            std::fill_n(output_data + (sample * rows + row) * width + head * head_width, head_width, 0.0f);
+            continue;
+        }
+        float largest = -std::numeric_limits<float>::infinity();
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+            const float b = bias != nullptr ? bias[k_idx * params.mask_key_stride] : 0.0f;
+            if (b <= -1e8f) {
+                scratch[k_idx] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
+            scratch[k_idx] = dot_f32_lanes8(q, k + k_idx * kv_width, head_width) * params.scale + b;
+            largest = std::max(largest, scratch[k_idx]);
+        }
+        float total = 0.0f;
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+            scratch[k_idx] =
+                scratch[k_idx] == -std::numeric_limits<float>::infinity() ? 0.0f : std::exp(scratch[k_idx] - largest);
+            total += scratch[k_idx];
+        }
+        const float inv_total = 1.0f / total;
+        float* out = output_data + (sample * rows + row) * width + head * head_width;
+        std::fill_n(out, head_width, 0.0f);
+        for (size_t k_idx = 0; k_idx < active_keys; ++k_idx) {
+            if (scratch[k_idx] == 0.0f) continue;
+            const float weight = scratch[k_idx] * inv_total;
+            accumulate_weighted_f32(out, v + k_idx * kv_width, weight, head_width);
+        }
+    }
+}
+
+void attention_prefill_f32(const attention_f32_params& params, const float* query_data, const float* key_data,
+                           const float* value_data, const float* mask, float* output_data) {
+    if (params.query_heads == 0 || params.key_value_heads == 0 || params.query_heads % params.key_value_heads != 0) {
+        return;
+    }
+    const size_t batch = params.batch_size;
+    const size_t rows = params.query_length;
+    const size_t heads = params.query_heads;
+    const size_t key_heads = params.key_value_heads;
+    const size_t head_width = params.head_dim;
+    const size_t width = heads * head_width;
+    const size_t kv_width = key_heads * head_width;
+    const size_t keys = params.key_length ? params.key_length : params.total_keys;
+    const size_t group_size = heads / key_heads;
+    const size_t q_group_rows = group_size * rows;
+    const size_t kv_groups = batch * key_heads;
+    if (rows == 0 || keys == 0 || head_width == 0) return;
+
+    struct PrefillScratch {
+        std::vector<float> q_buf;
+        std::vector<float> k_buf;
+        std::vector<float> v_buf;
+        std::vector<float> scores;
+        std::vector<float> out_buf;
+    };
+    thread_local PrefillScratch tls;
+    tls.q_buf.resize(q_group_rows * head_width);
+    if (key_heads > 1) {
+        tls.k_buf.resize(keys * head_width);
+        tls.v_buf.resize(keys * head_width);
+    }
+    tls.scores.resize(q_group_rows * keys);
+    tls.out_buf.resize(q_group_rows * head_width);
+    auto& q_buf = tls.q_buf;
+    auto& k_buf = tls.k_buf;
+    auto& v_buf = tls.v_buf;
+    auto& scores = tls.scores;
+    auto& out_buf = tls.out_buf;
+
+    for (size_t g = 0; g < kv_groups; ++g) {
+        const size_t sample = g / key_heads;
+        const size_t kv_head = g % key_heads;
+        const size_t first_q_head = kv_head * group_size;
+
+        const float* q_src = query_data + sample * rows * width + first_q_head * head_width;
+        for (size_t gh = 0; gh < group_size; ++gh) {
+            for (size_t r = 0; r < rows; ++r) {
+                std::memcpy(q_buf.data() + (gh * rows + r) * head_width, q_src + r * width + gh * head_width,
+                            head_width * sizeof(float));
+            }
+        }
+
+        const float* k_src =
+            key_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* v_src =
+            value_data + sample * params.key_batch_stride + (params.key_start * key_heads + kv_head) * head_width;
+        const float* k_mat = k_src;
+        const float* v_mat = v_src;
+        if (key_heads > 1) {
+            for (size_t t = 0; t < keys; ++t) {
+                std::memcpy(k_buf.data() + t * head_width, k_src + t * kv_width, head_width * sizeof(float));
+                std::memcpy(v_buf.data() + t * head_width, v_src + t * kv_width, head_width * sizeof(float));
+            }
+            k_mat = k_buf.data();
+            v_mat = v_buf.data();
+        }
+
+#if defined(__APPLE__)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(q_group_rows), static_cast<int>(keys),
+                    static_cast<int>(head_width), params.scale, q_buf.data(), static_cast<int>(head_width), k_mat,
+                    static_cast<int>(head_width), 0.0f, scores.data(), static_cast<int>(keys));
+#else
+        dense_linear_plan qk_plan{};
+        if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, keys, head_width, &qk_plan) !=
+            ynn_status_success) {
+            return;
+        }
+        aligned_byte_buffer packed_k(qk_plan.total_bytes);
+        pack_dense_linear_tiles(qk_plan, true, k_mat, head_width * sizeof(float), 0, qk_plan.blocks_n, packed_k.data());
+        bool ta = false;
+        size_t tm = 1, ab = 0;
+        dense_linear_select_kernel(qk_plan, q_group_rows, &ta, &tm, &ab);
+        aligned_byte_buffer pa(ab);
+        const void* eff_q = q_buf.data();
+        if (ta) {
+            dense_linear_pack_a(qk_plan, q_group_rows, tm, eff_q, head_width * sizeof(float), pa.data());
+            eff_q = pa.data();
+        }
+        dense_linear_run_tiles(qk_plan, q_group_rows, ta, tm, eff_q, head_width * sizeof(float), packed_k.data(),
+                               nullptr, scores.data(), keys, 0, qk_plan.blocks_n);
+        if (params.scale != 1.0f) {
+            for (float& s : scores) s *= params.scale;
+        }
+#endif
+
+        const auto mask_and_softmax = [&](size_t row_begin, size_t row_end) {
+            for (size_t row_idx = row_begin; row_idx < row_end; ++row_idx) {
+                const size_t gh = row_idx / rows;
+                const size_t r = row_idx % rows;
+                const size_t head = first_q_head + gh;
+                float* s_row = scores.data() + row_idx * keys;
+                if (mask != nullptr) {
+                    const float* m_row = mask + sample * params.mask_batch_stride + head * params.mask_head_stride +
+                                         r * params.mask_query_stride;
+                    if (params.mask_key_stride == 1) {
+                        for (size_t t = 0; t < keys; ++t) s_row[t] += m_row[t];
+                    } else if (params.mask_key_stride == 0) {
+                        const float mv = m_row[0];
+                        for (size_t t = 0; t < keys; ++t) s_row[t] += mv;
+                    } else {
+                        for (size_t t = 0; t < keys; ++t) s_row[t] += m_row[t * params.mask_key_stride];
+                    }
+                }
+                bool any_valid = false;
+                for (size_t t = 0; t < keys; ++t) {
+                    if (s_row[t] > -1e8f) {
+                        any_valid = true;
+                        break;
+                    }
+                }
+                if (!any_valid) {
+                    std::fill_n(s_row, keys, 0.0f);
+                } else {
+                    softmax_f32(1, keys, false, s_row, s_row, 0, 1);
+                }
+            }
+        };
+        if (q_group_rows * keys < 2048 || thread_count() <= 1) {
+            mask_and_softmax(0, q_group_rows);
+        } else {
+            struct SoftmaxCtx {
+                decltype(mask_and_softmax)* fn;
+            } sctx{&mask_and_softmax};
+            parallel_ranges(q_group_rows, 1, &sctx, [](void* raw, size_t begin, size_t end) {
+                (*static_cast<SoftmaxCtx*>(raw)->fn)(begin, end);
+            });
+        }
+
+#if defined(__APPLE__)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(q_group_rows),
+                    static_cast<int>(head_width), static_cast<int>(keys), 1.0f, scores.data(), static_cast<int>(keys),
+                    v_mat, static_cast<int>(head_width), 0.0f, out_buf.data(), static_cast<int>(head_width));
+#else
+        dense_linear_plan pv_plan{};
+        if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, head_width, keys, &pv_plan) !=
+            ynn_status_success) {
+            return;
+        }
+        aligned_byte_buffer packed_v(pv_plan.total_bytes);
+        pack_dense_linear_tiles(pv_plan, false, v_mat, head_width * sizeof(float), 0, pv_plan.blocks_n,
+                                packed_v.data());
+        bool ta2 = false;
+        size_t tm2 = 1, ab2 = 0;
+        dense_linear_select_kernel(pv_plan, q_group_rows, &ta2, &tm2, &ab2);
+        aligned_byte_buffer pa2(ab2);
+        const void* eff_p = scores.data();
+        if (ta2) {
+            dense_linear_pack_a(pv_plan, q_group_rows, tm2, eff_p, keys * sizeof(float), pa2.data());
+            eff_p = pa2.data();
+        }
+        dense_linear_run_tiles(pv_plan, q_group_rows, ta2, tm2, eff_p, keys * sizeof(float), packed_v.data(), nullptr,
+                               out_buf.data(), head_width, 0, pv_plan.blocks_n);
+#endif
+
+        float* out_dst = output_data + sample * rows * width + first_q_head * head_width;
+        for (size_t gh = 0; gh < group_size; ++gh) {
+            for (size_t r = 0; r < rows; ++r) {
+                std::memcpy(out_dst + r * width + gh * head_width, out_buf.data() + (gh * rows + r) * head_width,
+                            head_width * sizeof(float));
+            }
+        }
     }
 }
 

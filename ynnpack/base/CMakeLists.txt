@@ -10,17 +10,22 @@ SET_PROPERTY(CACHE YNN_LOG_LEVEL PROPERTY STRINGS error warning info debug verbo
 # ---[ Log library.
 ADD_LIBRARY(ynnpack_log INTERFACE)
 TARGET_COMPILE_DEFINITIONS(ynnpack_log INTERFACE YNN_LOG_LEVEL=YNN_LOG_LEVEL_${YNN_LOG_LEVEL})
-TARGET_LINK_LIBRARIES(ynnpack_log INTERFACE slinky_base)
 
 # ---[ Base library.
 ADD_LIBRARY(ynnpack_base STATIC
   arch.cc
+  thread_pool.cc
   to_string.cc
+  topology.cc
   type.cc
 )
 
 TARGET_INCLUDE_DIRECTORIES(ynnpack_base PUBLIC .)
-TARGET_LINK_LIBRARIES(ynnpack_base PUBLIC ynnpack_log slinky_base)
+TARGET_LINK_LIBRARIES(ynnpack_base PUBLIC ynnpack_log)
+IF(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+  FIND_PACKAGE(Threads REQUIRED)
+  TARGET_LINK_LIBRARIES(ynnpack_base PUBLIC Threads::Threads)
+ENDIF()
 
 # ---[ SIMD library.
 ADD_LIBRARY(ynnpack_simd INTERFACE)

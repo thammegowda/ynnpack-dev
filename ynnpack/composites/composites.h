@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
+#include "ynnpack/composites/hnsw.h"
 #include "ynnpack/include/ynnpack.h"
 
 namespace ynn {
@@ -47,92 +49,225 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
                              const int8_t* value, const float* mask, float* output, size_t row_start, size_t row_end,
                              void* scratch);
 
-// gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
-ynn_status define_gelu(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t& output_id);
+struct attention_f32_params {
+    size_t batch_size;
+    size_t query_length;
+    size_t query_heads;
+    size_t key_value_heads;
+    size_t key_start;
+    size_t key_length;
+    size_t total_keys;
+    size_t head_dim;
+    size_t key_batch_stride;
+    size_t mask_batch_stride;
+    size_t mask_head_stride;
+    size_t mask_query_stride;
+    size_t mask_key_stride;
+    float scale;
+};
 
-// approx_gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-ynn_status define_approx_gelu(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t& output_id);
+size_t attention_f32_work_items(const attention_f32_params& params);
+size_t attention_f32_scratch_size(const attention_f32_params& params);
+void attention_f32(const attention_f32_params& params, const float* query, const float* key, const float* value,
+                   const float* mask, float* output, size_t item_start, size_t item_end, float* scratch);
+void attention_prefill_f32(const attention_f32_params& params, const float* query, const float* key, const float* value,
+                           const float* mask, float* output);
 
-// elu(x) = x >= 0 ? x : alpha * (exp(x) - 1)
-ynn_status define_elu(ynn_subgraph_t subgraph, uint32_t input_id, float alpha, uint32_t& output_id);
+bool is_blockwise_linear_supported(int32_t bits);
+size_t blockwise_linear_tile_count(size_t n);
+size_t packed_blockwise_linear_size(int32_t bits, size_t n, size_t k, size_t block_size, bool has_zero);
+void pack_blockwise_linear_tiles(int32_t bits, size_t n, size_t k, size_t block_size, const void* weights,
+                                 const void* scales, bool scales_fp16, const void* zeros, bool zeros_fp16,
+                                 size_t tile_start, size_t tile_end, void* packed_tiles);
+void quantize_blockwise_activations_f32(int32_t bits, size_t m, size_t k, size_t block_size, bool compute_bsum,
+                                        const float* input, int8_t* quantized_input, float* input_scales,
+                                        float* input_bsums, size_t row_start, size_t row_end);
+void quantize_blockwise_blocks_f32(int32_t bits, size_t m, size_t k, size_t block_size, bool compute_bsum,
+                                   const float* input, int8_t* quantized_input, float* input_scales, float* input_bsums,
+                                   size_t block_start, size_t block_end);
+void blockwise_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, bool has_zero,
+                          float output_scale, const void* packed_tiles, const int8_t* quantized_input,
+                          const float* input_scales, const float* input_bsums, float* output, size_t tile_start,
+                          size_t tile_end);
 
-// leaky_relu(x) = x >= 0 ? x : alpha * x
-ynn_status define_leaky_relu(ynn_subgraph_t subgraph, uint32_t input_id, float alpha, uint32_t& output_id);
+bool is_symmetric_linear_supported(int32_t bits);
+size_t symmetric_linear_padded_block(size_t block_size);
+size_t packed_symmetric_linear_size(int32_t bits, size_t n, size_t k, size_t block_size);
+void pack_symmetric_linear_tiles(int32_t bits, size_t n, size_t k, size_t row_offset, size_t block_size,
+                                 const void* weights, const void* scales, bool scales_fp16, size_t tile_start,
+                                 size_t tile_end, void* packed_tiles);
+void quantize_symmetric_blocks_f32(int32_t bits, size_t m, size_t k, size_t block_size, float static_scale,
+                                   const float* input, int8_t* quantized_input, float* input_scales, size_t block_start,
+                                   size_t block_end);
+void symmetric_linear_f32(int32_t bits, size_t m, size_t n, size_t k, size_t block_size, float output_scale,
+                          const void* packed_tiles, const int8_t* quantized_input, const float* input_scales,
+                          float* output, size_t output_stride, size_t tile_start, size_t tile_end);
+void portable_packed_linear_unpack_weights(int32_t bits, const uint8_t* raw, size_t n, size_t k, size_t row_bytes,
+                                           int8_t* out);
+void portable_packed_linear_decode_meta(const void* meta, bool is_fp16, size_t count, float* out);
+void portable_packed_linear_f32(size_t rows, size_t n, size_t k, size_t block_size, float input_scale,
+                                float output_scale, bool has_zero, const float* x, const int8_t* w, const float* scales,
+                                const float* zeros, float* y, size_t row_start, size_t row_end);
 
-// hardswish(x) = x * clamp(x / 6 + 0.5, 0, 1)
-ynn_status define_hardswish(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t& output_id);
+struct dense_linear_plan {
+    ynn_type a_type = ynn_type_invalid;
+    ynn_type b_type = ynn_type_invalid;
+    ynn_type c_type = ynn_type_invalid;
+    size_t n = 0;
+    size_t k = 0;
+    size_t block_n = 0;
+    size_t tile_k = 0;
+    size_t tiles_k = 0;
+    size_t blocks_n = 0;
+    size_t tile_bytes = 0;
+    size_t total_bytes = 0;
+};
 
-// softmax(x)_i = exp(beta * x_i) / sum_j(exp(beta * x_j))
-ynn_status define_softmax(ynn_subgraph_t subgraph, uint32_t input_id, float beta, uint32_t& output_id);
+class aligned_byte_buffer {
+public:
+    aligned_byte_buffer() = default;
+    explicit aligned_byte_buffer(size_t bytes) { resize(bytes); }
+    ~aligned_byte_buffer() { reset(); }
+    aligned_byte_buffer(aligned_byte_buffer&& other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+    aligned_byte_buffer& operator=(aligned_byte_buffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+    aligned_byte_buffer(const aligned_byte_buffer&) = delete;
+    aligned_byte_buffer& operator=(const aligned_byte_buffer&) = delete;
 
-// log_softmax(x)_i = x_i - log(sum_j(exp(x_j)))
-ynn_status define_log_softmax(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t& output_id);
+    void resize(size_t bytes) {
+        if (bytes > capacity_) {
+            reset();
+            if (bytes > 0) {
+                data_ = static_cast<uint8_t*>(::operator new(bytes, std::align_val_t{256}));
+                capacity_ = bytes;
+            }
+        }
+        size_ = bytes;
+    }
+    uint8_t* data() noexcept { return data_; }
+    const uint8_t* data() const noexcept { return data_; }
+    size_t size() const noexcept { return size_; }
 
-// Computes average pooling of a 2D buffer. The `input_id` and `output_id`
-// values must refer to rank 4 tensors. When averaging, the number of samples is
-// the number of samples that are not padding.
-ynn_status define_average_pool_2d(ynn_subgraph_t subgraph, uint32_t input_id, ynn_type type, bool padding_same,
-                                  size_t filter_height, size_t filter_width, size_t stride_height, size_t stride_width,
-                                  uint32_t& output_id);
+private:
+    void reset() noexcept {
+        if (data_ != nullptr) ::operator delete(data_, std::align_val_t{256});
+        data_ = nullptr;
+        size_ = 0;
+        capacity_ = 0;
+    }
+    uint8_t* data_ = nullptr;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+};
 
-// Computes a sum reduction, optionally dividing by the number of elements in
-// the reduction if `mean` is true. The quantization parameters may be
-// `YNN_INVALID_VALUE_ID`, indicating an identity value of 0 (for zero point) or
-// 1 (for scale).
-ynn_status define_reduce_sum(ynn_subgraph_t subgraph, size_t num_axes, const int32_t* axes, uint32_t input_id,
-                             uint32_t input_zero_point_id, uint32_t input_scale_id, bool keep_dims, bool mean,
-                             bool squared, ynn_type output_type, uint32_t output_zero_point_id,
-                             uint32_t output_scale_id, uint32_t& output_id);
+ynn_status make_dense_linear_plan(ynn_type a_type, ynn_type b_type, ynn_type c_type, size_t n, size_t k,
+                                  dense_linear_plan* out_plan);
+void pack_dense_linear_tiles(const dense_linear_plan& plan, bool transpose_b, const void* b_ptr,
+                             size_t b_row_stride_bytes, size_t tile_start, size_t tile_end, void* packed_tiles,
+                             int32_t* col_sums = nullptr);
+bool dense_linear_select_kernel(const dense_linear_plan& plan, size_t m, bool* out_transpose_a, size_t* out_tile_m,
+                                size_t* out_a_packed_bytes);
+void dense_linear_pack_a(const dense_linear_plan& plan, size_t m, size_t tile_m, const void* a_ptr,
+                         size_t a_row_stride_bytes, void* a_packed);
+void dense_linear_run_tiles(const dense_linear_plan& plan, size_t m, bool transposed_a, size_t tile_m,
+                            const void* a_ptr, size_t a_row_stride_bytes, const void* packed_b, const float* bias_f32,
+                            float* output_f32, size_t output_stride_elems, size_t tile_start, size_t tile_end);
+void quantize_dynamic_int8_rows_f32(size_t rows, size_t k, const float* input, int8_t* quantized, float* scales,
+                                    int32_t* zero_points, size_t row_start, size_t row_end);
+size_t quantized_linear_scratch_bytes(const dense_linear_plan& plan, size_t m, size_t tile_m);
+void quantized_linear_run_tiles(const dense_linear_plan& plan, size_t m, bool transposed_a, size_t tile_m,
+                                const void* a_ptr, size_t a_row_stride_bytes, const void* packed_b,
+                                const int32_t* b_col_sums, const float* a_scales, const int32_t* a_zero_points,
+                                const float* b_scales, const float* bias_f32, float* output_f32,
+                                size_t output_stride_elems, int32_t* i32_scratch, size_t tile_start, size_t tile_end);
+void convert_f32_to_bf16_rows(size_t rows, size_t cols, const float* src, size_t src_stride_elems, uint16_t* dst,
+                              size_t dst_stride_elems, size_t row_start, size_t row_end);
+void convert_bf16_to_f32_rows(size_t rows, size_t cols, const uint16_t* src, size_t src_stride_elems, float* dst,
+                              size_t dst_stride_elems, size_t row_start, size_t row_end);
 
-// This function computes the quantization parameters of the result of a
-// quantized dot operation. It computes the `zero_point` and `scale` values of
-// the following equivalence:
-//
-//   (a.b - zero_point)*scale =
-//       ((a - a_zero_point)*a_scale).(b - b_zerp_point)*b_scale
-//
-// It supports dynamic and static quantization parameters.
-ynn_status define_dot_quantization(ynn_subgraph_t subgraph, size_t num_k_dims, uint32_t a_id, uint32_t a_zero_point_id,
-                                   uint32_t a_scale_id, uint32_t b_id, uint32_t b_zero_point_id, uint32_t b_scale_id,
-                                   uint32_t& zero_point_id, uint32_t& scale_id);
+void layer_norm_f32(size_t rows, size_t width, float epsilon, const float* input, const float* residual_in,
+                    const float* weight, const float* bias, float* output_norm, float* output_residual,
+                    size_t row_start, size_t row_end);
+void softmax_f32(size_t rows, size_t width, bool logarithmic, const float* input, float* output, size_t row_start,
+                 size_t row_end);
+void gelu_f32(size_t count, bool approximate, const float* input, float* output, size_t start, size_t end);
+void tanh_f32(size_t count, const float* input, float* output, size_t start, size_t end);
+void static_round_f32(size_t count, float scale, const float* input, float* output, size_t start, size_t end);
+void cast_elements(ynn_type src_type, ynn_type dst_type, size_t count, const void* src, void* dst, size_t start,
+                   size_t end);
+void broadcast_binary_f32(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const float* a, const float* b, float* out,
+                          size_t start, size_t end);
+void transpose_elements(size_t elem_bytes, size_t rank, const size_t* in_shape, const size_t* out_strides_elems,
+                        const uint8_t* src, uint8_t* dst, size_t outer_start, size_t outer_end);
+void slice_blocks(size_t outer, size_t src_stride_bytes, size_t dst_stride_bytes, size_t offset_bytes, const void* src,
+                  void* dst, size_t begin, size_t end);
+void gather_elements(size_t elem_bytes, size_t axis_len, size_t inner, size_t index_count, bool idx_is_i64,
+                     const void* src, const void* indices, void* dst, size_t task_begin, size_t task_end);
+void scatter_rows(size_t batch_count, size_t dst_seq_len, size_t index_count, size_t row_bytes, const int32_t* indices,
+                  const void* src, void* dst);
+void broadcast_binary_i32(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int32_t* a, const int32_t* b,
+                          int32_t* out);
+void broadcast_binary_i64(bool is_multiply, size_t rank, const size_t* out_shape, const size_t* a_strides,
+                          const size_t* b_strides, size_t out_elements, const int64_t* a, const int64_t* b,
+                          int64_t* out);
 
-// Splits an f32 value into multiple bf16 values such that
-// `sum(f32(output_ids[i])) ~= input_id`. The output values are ordered by
-// descending significance.
-ynn_status define_convert_f32_to_bf16_sum(ynn_subgraph_t subgraph, uint32_t input_id, size_t num_values,
-                                          uint32_t* output_ids, uint32_t flags);
+void transpose_packed_subbyte_tile(int32_t bits, const uint8_t* source, size_t source_stride_bytes, size_t row_start,
+                                   size_t row_count, size_t col_start, size_t col_count, uint8_t* destination);
+size_t gated_activation_tile_count(size_t rows, size_t width);
+ynn_status silu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end);
+ynn_status silu_gate_tiles_f32(size_t rows, size_t width, const float* input, float* output, size_t tile_start,
+                               size_t tile_end);
+ynn_status gelu_gate_f32(size_t rows, size_t width, const float* input, float* output, size_t row_start,
+                         size_t row_end);
+ynn_status gelu_gate_tiles_f32(size_t rows, size_t width, const float* input, float* output, size_t tile_start,
+                               size_t tile_end);
+size_t gated_multiply_tile_count(size_t elements);
+ynn_status silu_multiply_tiles_f32(size_t elements, const float* gate, const float* up, float* output,
+                                   size_t tile_start, size_t tile_end);
+ynn_status gelu_multiply_tiles_f32(size_t elements, const float* gate, const float* up, float* output,
+                                   size_t tile_start, size_t tile_end);
+ynn_status packed_ffn_mid_tiles_f32(int32_t bits, size_t m, size_t input_size, size_t intermediate_size,
+                                    float gate_output_scale, float down_input_scale, bool silu, const void* gate_packed,
+                                    const void* up_packed, const int8_t* quantized_input, const float* input_scales,
+                                    int8_t* quantized_mid, size_t tile_start, size_t tile_end);
+void elementwise_binary_f32(bool is_multiply, size_t elements, size_t rhs_stride, const float* lhs, const float* rhs,
+                            float* output, size_t start, size_t end);
 
-// Compute the dot of values that have been split into descending significance
-// components. This computes the sum of the dot of the values in the cartesian
-// product of a_ids x b_ids, where the sum of the index of the two values is
-// not greater than `max_sum_index`.
-ynn_status define_dot_sum(ynn_subgraph_t subgraph, size_t num_k_dims, size_t num_a_values, const uint32_t* a_ids,
-                          size_t num_b_values, const uint32_t* b_ids, uint32_t input_c_id, uint32_t& output_id,
-                          uint32_t flags, int max_sum_index = -1);
+void rms_norm_f32(size_t rows, size_t width, float epsilon, const float* input, const float* weight,
+                  const float* residual, bool has_scale, float scale, float* output, size_t row_start, size_t row_end);
+void rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool shared_angles, const float* input,
+                const float* cosine, const float* sine, float* output, size_t row_start, size_t row_end);
+void rms_rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool sliced, size_t input_rows,
+                    size_t input_stride, size_t sequence_offset, size_t channel_offset, float epsilon,
+                    bool shared_angles, const float* input, const float* weight, const float* cosine, const float* sine,
+                    float* output, size_t vec_start, size_t vec_end);
 
-// Computes a blockwise quantized dot product of `a_id` and `b_id`.
-// `a_id` has shape [..., M, K] (or [K] if rank 1).
-// `b_id` has shape [..., K, N].
-// `b_scale_id` is the scale tensor for `b_id` (either [..., N, num_blocks] or
-// [..., num_blocks, 1, N]). `b_zero_point_id` is the zero point tensor for
-// `b_id` (or YNN_INVALID_VALUE_ID). `a_zero_point_id` and `a_scale_id` are
-// quantization parameters for `a_id` (or YNN_INVALID_VALUE_ID). `bias_id` is
-// an optional bias tensor of shape [N] (or YNN_INVALID_VALUE_ID). `output_id`
-// receives the result tensor.
-ynn_status define_blockwise_dot(ynn_subgraph_t subgraph, uint32_t a_id, uint32_t a_zero_point_id, uint32_t a_scale_id,
-                                uint32_t b_id, uint32_t b_zero_point_id, uint32_t b_scale_id, size_t block_size,
-                                uint32_t bias_id, ynn_type output_type, uint32_t& output_id, uint32_t flags = 0);
-
-// Computes a calibrated packed feed-forward layer in bounded intermediate
-// tiles. If `gated` is true, the first weight contains gate rows followed by
-// up rows and the activation is approx_gelu(gate) * up.
-ynn_status define_packed_feed_forward(ynn_subgraph_t subgraph, uint32_t input_id, uint32_t input_scale_id,
-                                      const uint32_t* gate_weight_ids, const uint32_t* gate_scale_ids,
-                                      const uint32_t* up_weight_ids, const uint32_t* up_scale_ids,
-                                      uint32_t first_output_scale_id, const uint32_t* down_weight_ids,
-                                      uint32_t down_scale_id, uint32_t down_input_scale_id,
-                                      uint32_t down_output_scale_id, size_t input_size, size_t intermediate_size,
-                                      size_t tile_size, bool gated, uint32_t& output_id);
+void dequantize_embedding_f32(const int32_t* tokens, size_t num_tokens, const void* weights, bool weights_bf16,
+                              int32_t packed_bits, bool unsigned_packed, size_t width, size_t groups,
+                              const void* scales, bool scales_fp16, const void* zeros, bool zeros_fp16,
+                              float multiplier, float* output, size_t row_start, size_t row_end);
+void quantize_symmetric_int8_f32(size_t count, float scale, const float* input, int8_t* output);
+void argmax_chunk_f32(size_t count, const float* row_logits, size_t col_offset, float* out_max, int32_t* out_index,
+                      bool* out_invalid);
+void argmax_rows_f32(size_t rows, size_t width, const float* logits, int32_t* tokens);
 
 } // namespace ynn
 

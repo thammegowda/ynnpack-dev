@@ -9,7 +9,7 @@ PROJECT(ynnpack C CXX)
 
 INCLUDE_DIRECTORIES("${PROJECT_SOURCE_DIR}/..")
 
-SET(CMAKE_CXX_STANDARD 17)
+SET(CMAKE_CXX_STANDARD 20)
 SET(CMAKE_CXX_STANDARD_REQUIRED YES)
 SET(CMAKE_CXX_EXTENSIONS NO)
 
@@ -24,7 +24,6 @@ ENDIF()
 # ---[ Options.
 OPTION(YNNPACK_BUILD_TESTS "Build YNNPACK unit tests" OFF)
 OPTION(YNNPACK_BUILD_BENCHMARKS "Build YNNPACK benchmarks" OFF)
-OPTION(YNNPACK_USE_SYSTEM_LIBS "Use an installed Slinky package" OFF)
 
 IF(YNNPACK_BUILD_TESTS)
   ENABLE_TESTING()
@@ -219,15 +218,6 @@ OPTION(YNN_ENABLE_WASM_SIMD128 "Enable Wasm SIMD128" ${YNN_WASM_DEFAULT})
 
 OPTION(YNN_ENABLE_CPUINFO "Enable cpuinfo" ${YNN_CPUINFO_DEFAULT})
 
-# ---[ Dependencies.
-IF(NOT TARGET slinky_base)
-  IF(YNNPACK_USE_SYSTEM_LIBS)
-    FIND_PACKAGE(slinky REQUIRED)
-  ELSE()
-    MESSAGE(FATAL_ERROR "Slinky is missing; add YNNPACK through the ynnpack-dev project root")
-  ENDIF()
-ENDIF()
-
 # ---[ Includes.
 INCLUDE_DIRECTORIES(include)
 INCLUDE_DIRECTORIES(.)
@@ -236,7 +226,6 @@ INCLUDE_DIRECTORIES(.)
 ADD_SUBDIRECTORY(base)
 ADD_SUBDIRECTORY(composites)
 ADD_SUBDIRECTORY(kernels)
-ADD_SUBDIRECTORY(subgraph)
 
 # ---[ Main library.
 ADD_LIBRARY(ynnpack INTERFACE)
@@ -244,4 +233,11 @@ TARGET_INCLUDE_DIRECTORIES(ynnpack INTERFACE
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>"
 )
-TARGET_LINK_LIBRARIES(ynnpack INTERFACE ynnpack_subgraph)
+TARGET_LINK_LIBRARIES(ynnpack INTERFACE
+  ynnpack_base
+  ynnpack_kernels_binary
+  ynnpack_kernels_dot
+  ynnpack_kernels_reduce
+  ynnpack_kernels_transpose
+  ynnpack_kernels_unary
+)
