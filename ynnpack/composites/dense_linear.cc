@@ -231,7 +231,7 @@ ynn_status make_dense_linear_plan(ynn_type a_type, ynn_type b_type, ynn_type c_t
 
     const size_t tiles_k = ceil_div(k, tile_k);
     const size_t blocks_n = ceil_div(n, block_n);
-    const size_t tile_bytes = tiles_k * block_n * tile_k * elem_bytes;
+    const size_t tile_bytes = align_up<size_t>(tiles_k * block_n * tile_k * elem_bytes, 256);
 
     *out_plan = dense_linear_plan{
         .a_type = a_type,

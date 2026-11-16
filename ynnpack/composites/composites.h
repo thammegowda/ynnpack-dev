@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
 #include "ynnpack/composites/hnsw.h"
 #include "ynnpack/include/ynnpack.h"
@@ -120,6 +121,58 @@ struct dense_linear_plan {
     size_t blocks_n = 0;
     size_t tile_bytes = 0;
     size_t total_bytes = 0;
+};
+
+class aligned_byte_buffer {
+public:
+    aligned_byte_buffer() = default;
+    explicit aligned_byte_buffer(size_t bytes) { resize(bytes); }
+    ~aligned_byte_buffer() { reset(); }
+    aligned_byte_buffer(aligned_byte_buffer&& other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+    aligned_byte_buffer& operator=(aligned_byte_buffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+    aligned_byte_buffer(const aligned_byte_buffer&) = delete;
+    aligned_byte_buffer& operator=(const aligned_byte_buffer&) = delete;
+
+    void resize(size_t bytes) {
+        if (bytes > capacity_) {
+            reset();
+            if (bytes > 0) {
+                data_ = static_cast<uint8_t*>(::operator new(bytes, std::align_val_t{256}));
+                capacity_ = bytes;
+            }
+        }
+        size_ = bytes;
+    }
+    uint8_t* data() noexcept { return data_; }
+    const uint8_t* data() const noexcept { return data_; }
+    size_t size() const noexcept { return size_; }
+
+private:
+    void reset() noexcept {
+        if (data_ != nullptr) ::operator delete(data_, std::align_val_t{256});
+        data_ = nullptr;
+        size_ = 0;
+        capacity_ = 0;
+    }
+    uint8_t* data_ = nullptr;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
 };
 
 ynn_status make_dense_linear_plan(ynn_type a_type, ynn_type b_type, ynn_type c_type, size_t n, size_t k,

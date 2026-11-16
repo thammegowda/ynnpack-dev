@@ -498,11 +498,26 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
     const size_t kv_groups = batch * key_heads;
     if (rows == 0 || keys == 0 || head_width == 0) return;
 
-    std::vector<float> q_buf(q_group_rows * head_width);
-    std::vector<float> k_buf(key_heads > 1 ? keys * head_width : 0);
-    std::vector<float> v_buf(key_heads > 1 ? keys * head_width : 0);
-    std::vector<float> scores(q_group_rows * keys);
-    std::vector<float> out_buf(q_group_rows * head_width);
+    struct PrefillScratch {
+        std::vector<float> q_buf;
+        std::vector<float> k_buf;
+        std::vector<float> v_buf;
+        std::vector<float> scores;
+        std::vector<float> out_buf;
+    };
+    thread_local PrefillScratch tls;
+    tls.q_buf.resize(q_group_rows * head_width);
+    if (key_heads > 1) {
+        tls.k_buf.resize(keys * head_width);
+        tls.v_buf.resize(keys * head_width);
+    }
+    tls.scores.resize(q_group_rows * keys);
+    tls.out_buf.resize(q_group_rows * head_width);
+    auto& q_buf = tls.q_buf;
+    auto& k_buf = tls.k_buf;
+    auto& v_buf = tls.v_buf;
+    auto& scores = tls.scores;
+    auto& out_buf = tls.out_buf;
 
     for (size_t g = 0; g < kv_groups; ++g) {
         const size_t sample = g / key_heads;
@@ -542,12 +557,12 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
             ynn_status_success) {
             return;
         }
-        std::vector<uint8_t> packed_k(qk_plan.total_bytes);
+        aligned_byte_buffer packed_k(qk_plan.total_bytes);
         pack_dense_linear_tiles(qk_plan, true, k_mat, head_width * sizeof(float), 0, qk_plan.blocks_n, packed_k.data());
         bool ta = false;
         size_t tm = 1, ab = 0;
         dense_linear_select_kernel(qk_plan, q_group_rows, &ta, &tm, &ab);
-        std::vector<uint8_t> pa(ab);
+        aligned_byte_buffer pa(ab);
         const void* eff_q = q_buf.data();
         if (ta) {
             dense_linear_pack_a(qk_plan, q_group_rows, tm, eff_q, head_width * sizeof(float), pa.data());
@@ -592,7 +607,7 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
                 }
             }
         };
-        if (q_group_rows * keys < 8192 || thread_count() <= 1) {
+        if (q_group_rows * keys < 2048 || thread_count() <= 1) {
             mask_and_softmax(0, q_group_rows);
         } else {
             struct SoftmaxCtx {
@@ -613,13 +628,13 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
             ynn_status_success) {
             return;
         }
-        std::vector<uint8_t> packed_v(pv_plan.total_bytes);
+        aligned_byte_buffer packed_v(pv_plan.total_bytes);
         pack_dense_linear_tiles(pv_plan, false, v_mat, head_width * sizeof(float), 0, pv_plan.blocks_n,
                                 packed_v.data());
         bool ta2 = false;
         size_t tm2 = 1, ab2 = 0;
         dense_linear_select_kernel(pv_plan, q_group_rows, &ta2, &tm2, &ab2);
-        std::vector<uint8_t> pa2(ab2);
+        aligned_byte_buffer pa2(ab2);
         const void* eff_p = scores.data();
         if (ta2) {
             dense_linear_pack_a(pv_plan, q_group_rows, tm2, eff_p, keys * sizeof(float), pa2.data());

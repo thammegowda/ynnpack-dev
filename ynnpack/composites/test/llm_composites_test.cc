@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -447,7 +448,7 @@ TEST(LlmCompositesTest, DenseLinearF32AndBf16) {
             std::vector<bfloat16> b_bf16(b_f32.size());
             for (size_t i = 0; i < b_f32.size(); ++i) b_bf16[i] = bfloat16(b_f32[i]);
 
-            std::vector<uint8_t> packed_b(plan.total_bytes);
+            aligned_byte_buffer packed_b(plan.total_bytes);
             if (dt == ynn_type_fp32) {
                 pack_dense_linear_tiles(plan, transpose_b, b_f32.data(), b_cols * sizeof(float), 0, plan.blocks_n,
                                         packed_b.data());
@@ -471,7 +472,7 @@ TEST(LlmCompositesTest, DenseLinearF32AndBf16) {
                 ASSERT_TRUE(dense_linear_select_kernel(plan, M, &transposed_a, &tile_m, &a_packed_bytes));
 
                 const void* eff_a = dt == ynn_type_fp32 ? static_cast<const void*>(a_f32.data()) : a_bf16.data();
-                std::vector<uint8_t> a_packed(a_packed_bytes);
+                aligned_byte_buffer a_packed(a_packed_bytes);
                 if (transposed_a) {
                     dense_linear_pack_a(plan, M, tile_m, eff_a,
                                         K * (dt == ynn_type_fp32 ? sizeof(float) : sizeof(bfloat16)), a_packed.data());
@@ -510,7 +511,7 @@ TEST(LlmCompositesTest, QuantizedLinearInt8) {
         const size_t b_cols = transpose_b ? K : N;
         std::vector<int8_t> b(b_rows * b_cols);
         for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<int8_t>(static_cast<int>(i % 29) - 14);
-        std::vector<uint8_t> packed_b(plan.total_bytes);
+        aligned_byte_buffer packed_b(plan.total_bytes);
         std::vector<int32_t> col_sums(N, 0);
         pack_dense_linear_tiles(plan, transpose_b, b.data(), b_cols, 0, plan.blocks_n, packed_b.data(),
                                 col_sums.data());
@@ -534,7 +535,7 @@ TEST(LlmCompositesTest, QuantizedLinearInt8) {
             size_t tile_m = 1, a_packed_bytes = 0;
             ASSERT_TRUE(dense_linear_select_kernel(plan, M, &transposed_a, &tile_m, &a_packed_bytes));
             const void* eff_a = q_a.data();
-            std::vector<uint8_t> a_packed(a_packed_bytes);
+            aligned_byte_buffer a_packed(a_packed_bytes);
             if (transposed_a) {
                 dense_linear_pack_a(plan, M, tile_m, q_a.data(), K, a_packed.data());
                 eff_a = a_packed.data();
