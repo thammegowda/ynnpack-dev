@@ -219,15 +219,6 @@ OPTION(YNN_ENABLE_WASM_SIMD128 "Enable Wasm SIMD128" ${YNN_WASM_DEFAULT})
 
 OPTION(YNN_ENABLE_CPUINFO "Enable cpuinfo" ${YNN_CPUINFO_DEFAULT})
 
-# ---[ Dependencies.
-IF(NOT TARGET slinky_base)
-  IF(YNNPACK_USE_SYSTEM_LIBS)
-    FIND_PACKAGE(slinky REQUIRED)
-  ELSE()
-    MESSAGE(FATAL_ERROR "Slinky is missing; add YNNPACK through the ynnpack-dev project root")
-  ENDIF()
-ENDIF()
-
 # ---[ Includes.
 INCLUDE_DIRECTORIES(include)
 INCLUDE_DIRECTORIES(.)
@@ -236,7 +227,6 @@ INCLUDE_DIRECTORIES(.)
 ADD_SUBDIRECTORY(base)
 ADD_SUBDIRECTORY(composites)
 ADD_SUBDIRECTORY(kernels)
-ADD_SUBDIRECTORY(subgraph)
 
 # ---[ Main library.
 ADD_LIBRARY(ynnpack INTERFACE)
@@ -244,4 +234,11 @@ TARGET_INCLUDE_DIRECTORIES(ynnpack INTERFACE
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/..>"
 )
-TARGET_LINK_LIBRARIES(ynnpack INTERFACE ynnpack_subgraph)
+TARGET_LINK_LIBRARIES(ynnpack INTERFACE
+  ynnpack_base
+  ynnpack_kernels_binary
+  ynnpack_kernels_dot
+  ynnpack_kernels_reduce
+  ynnpack_kernels_transpose
+  ynnpack_kernels_unary
+)
