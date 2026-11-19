@@ -8,6 +8,7 @@
 // LICENSES/llama.cpp.txt.
 
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/composites/composites_internal.h"
 #include "ynnpack/base/thread_pool.h"
 
 #include <algorithm>
@@ -17,16 +18,6 @@
 #include <cstring>
 #include <limits>
 #include <vector>
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-#if defined(__APPLE__)
-#ifndef ACCELERATE_NEW_LAPACK
-#define ACCELERATE_NEW_LAPACK
-#endif
-#include <Accelerate/Accelerate.h>
-#endif
 
 namespace ynn {
 
@@ -52,40 +43,13 @@ bool valid_quantization(size_t width, const blockwise_quantization_f32_params& q
 }
 
 int32_t dot_i8(size_t size, const int8_t* query, const int8_t* key, int32_t query_zero_point, int32_t key_zero_point) {
+    int32_t fast_dot = 0;
+    if (detail::arch_dot_i8_with_zp(size, query, key, query_zero_point, key_zero_point, &fast_dot)) {
+        return fast_dot;
+    }
     int32_t result = 0;
     int32_t query_sum = 0;
     int32_t key_sum = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    int32x4_t dot = vdupq_n_s32(0);
-    size_t channel = 0;
-    for (; channel + 16 <= size; channel += 16) {
-        const int8x16_t query_values = vld1q_s8(query + channel);
-        const int8x16_t key_values = vld1q_s8(key + channel);
-        dot = vdotq_s32(dot, query_values, key_values);
-        if (key_zero_point != 0) {
-            query_sum += vaddlvq_s8(query_values);
-        }
-        key_sum += vaddlvq_s8(key_values);
-    }
-    result = vaddvq_s32(dot);
-    if (channel + 8 <= size) {
-        const int8x8_t query_values = vld1_s8(query + channel);
-        const int8x8_t key_values = vld1_s8(key + channel);
-        result += vaddlvq_s16(vmull_s8(query_values, key_values));
-        if (key_zero_point != 0) {
-            query_sum += vaddlv_s8(query_values);
-        }
-        key_sum += vaddlv_s8(key_values);
-        channel += 8;
-    }
-    for (; channel < size; ++channel) {
-        result += query[channel] * key[channel];
-        if (key_zero_point != 0) {
-            query_sum += query[channel];
-        }
-        key_sum += key[channel];
-    }
-#else
     for (size_t channel = 0; channel < size; ++channel) {
         result += query[channel] * key[channel];
         if (key_zero_point != 0) {
@@ -93,7 +57,6 @@ int32_t dot_i8(size_t size, const int8_t* query, const int8_t* key, int32_t quer
         }
         key_sum += key[channel];
     }
-#endif
     return result - query_zero_point * key_sum - key_zero_point * query_sum +
            static_cast<int32_t>(size) * query_zero_point * key_zero_point;
 }
@@ -117,43 +80,16 @@ void quantize_query(size_t size, const float* input, int8_t* output, float& scal
 }
 
 void scale_output(size_t size, float scale, float* output) {
-#if defined(__ARM_NEON)
-    const float32x4_t scale_vector = vdupq_n_f32(scale);
-    size_t channel = 0;
-    for (; channel + 8 <= size; channel += 8) {
-        vst1q_f32(output + channel, vmulq_f32(vld1q_f32(output + channel), scale_vector));
-        vst1q_f32(output + channel + 4, vmulq_f32(vld1q_f32(output + channel + 4), scale_vector));
-    }
-    for (; channel < size; ++channel) {
+    for (size_t channel = detail::arch_scale_f32(size, scale, output); channel < size; ++channel) {
         output[channel] *= scale;
     }
-#else
-    for (size_t channel = 0; channel < size; ++channel) {
-        output[channel] *= scale;
-    }
-#endif
 }
 
 void accumulate_value(size_t size, const int8_t* value, int32_t zero_point, float scale, float weight, float* output) {
-#if defined(__ARM_NEON)
-    const int32x4_t zero = vdupq_n_s32(zero_point);
-    const float32x4_t multiplier = vdupq_n_f32(scale * weight);
-    size_t channel = 0;
-    for (; channel + 8 <= size; channel += 8) {
-        const int16x8_t value_i16 = vmovl_s8(vld1_s8(value + channel));
-        const float32x4_t value0 = vcvtq_f32_s32(vsubq_s32(vmovl_s16(vget_low_s16(value_i16)), zero));
-        const float32x4_t value1 = vcvtq_f32_s32(vsubq_s32(vmovl_s16(vget_high_s16(value_i16)), zero));
-        vst1q_f32(output + channel, vfmaq_f32(vld1q_f32(output + channel), value0, multiplier));
-        vst1q_f32(output + channel + 4, vfmaq_f32(vld1q_f32(output + channel + 4), value1, multiplier));
-    }
+    size_t channel = detail::arch_accumulate_i8_value_f32(size, value, zero_point, scale, weight, output);
     for (; channel < size; ++channel) {
         output[channel] += weight * (static_cast<float>(value[channel] - zero_point) * scale);
     }
-#else
-    for (size_t channel = 0; channel < size; ++channel) {
-        output[channel] += weight * (static_cast<float>(value[channel] - zero_point) * scale);
-    }
-#endif
 }
 
 void compute_row(const quantized_attention_f32_params& params, const float* query, const int8_t* key,
@@ -291,28 +227,17 @@ void quantized_attention_f32(const quantized_attention_f32_params& params, const
 namespace {
 
 float dot_f32_lanes8(const float* left, const float* right, size_t count) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+    YNN_DISABLE_FP_CONTRACT
+    float fast_sum = 0.0f;
+    if (detail::arch_dot_f32_lanes8(left, right, count, &fast_sum)) return fast_sum;
+
     size_t index = 0;
-#if defined(__ARM_NEON)
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    for (; index + 8 <= count; index += 8) {
-        acc0 = vaddq_f32(acc0, vmulq_f32(vld1q_f32(left + index), vld1q_f32(right + index)));
-        acc1 = vaddq_f32(acc1, vmulq_f32(vld1q_f32(left + index + 4), vld1q_f32(right + index + 4)));
-    }
-    float lanes[8];
-    vst1q_f32(lanes, acc0);
-    vst1q_f32(lanes + 4, acc1);
-#else
     float lanes[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (; index + 8 <= count; index += 8) {
         for (size_t lane = 0; lane < 8; ++lane) {
             lanes[lane] += left[index + lane] * right[index + lane];
         }
     }
-#endif
     float sum = 0.0f;
     for (size_t lane = 0; lane < 8; ++lane) sum += lanes[lane];
     for (; index < count; ++index) sum += left[index] * right[index];
@@ -320,18 +245,10 @@ float dot_f32_lanes8(const float* left, const float* right, size_t count) {
 }
 
 inline void accumulate_weighted_f32(float* dst, const float* src, float weight, size_t count) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
-    size_t index = 0;
-#if defined(__ARM_NEON)
-    const float32x4_t vw = vdupq_n_f32(weight);
-    for (; index + 8 <= count; index += 8) {
-        vst1q_f32(dst + index, vaddq_f32(vld1q_f32(dst + index), vmulq_f32(vld1q_f32(src + index), vw)));
-        vst1q_f32(dst + index + 4, vaddq_f32(vld1q_f32(dst + index + 4), vmulq_f32(vld1q_f32(src + index + 4), vw)));
+    YNN_DISABLE_FP_CONTRACT
+    for (size_t index = detail::arch_accumulate_weighted_f32(dst, src, weight, count); index < count; ++index) {
+        dst[index] += weight * src[index];
     }
-#endif
-    for (; index < count; ++index) dst[index] += weight * src[index];
 }
 
 bool is_single_gqa8_step(const attention_f32_params& params) {
@@ -547,33 +464,31 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
             v_mat = v_buf.data();
         }
 
-#if defined(__APPLE__)
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(q_group_rows), static_cast<int>(keys),
-                    static_cast<int>(head_width), params.scale, q_buf.data(), static_cast<int>(head_width), k_mat,
-                    static_cast<int>(head_width), 0.0f, scores.data(), static_cast<int>(keys));
-#else
-        dense_linear_plan qk_plan{};
-        if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, keys, head_width, &qk_plan) !=
-            ynn_status_success) {
-            return;
+        if (!detail::arch_sgemm_f32(true, q_group_rows, keys, head_width, params.scale, q_buf.data(), head_width, k_mat,
+                                    head_width, scores.data(), keys)) {
+            dense_linear_plan qk_plan{};
+            if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, keys, head_width, &qk_plan) !=
+                ynn_status_success) {
+                return;
+            }
+            aligned_byte_buffer packed_k(qk_plan.total_bytes);
+            pack_dense_linear_tiles(qk_plan, true, k_mat, head_width * sizeof(float), 0, qk_plan.blocks_n,
+                                    packed_k.data());
+            bool ta = false;
+            size_t tm = 1, ab = 0;
+            dense_linear_select_kernel(qk_plan, q_group_rows, &ta, &tm, &ab);
+            aligned_byte_buffer pa(ab);
+            const void* eff_q = q_buf.data();
+            if (ta) {
+                dense_linear_pack_a(qk_plan, q_group_rows, tm, eff_q, head_width * sizeof(float), pa.data());
+                eff_q = pa.data();
+            }
+            dense_linear_run_tiles(qk_plan, q_group_rows, ta, tm, eff_q, head_width * sizeof(float), packed_k.data(),
+                                   nullptr, scores.data(), keys, 0, qk_plan.blocks_n);
+            if (params.scale != 1.0f) {
+                for (float& s : scores) s *= params.scale;
+            }
         }
-        aligned_byte_buffer packed_k(qk_plan.total_bytes);
-        pack_dense_linear_tiles(qk_plan, true, k_mat, head_width * sizeof(float), 0, qk_plan.blocks_n, packed_k.data());
-        bool ta = false;
-        size_t tm = 1, ab = 0;
-        dense_linear_select_kernel(qk_plan, q_group_rows, &ta, &tm, &ab);
-        aligned_byte_buffer pa(ab);
-        const void* eff_q = q_buf.data();
-        if (ta) {
-            dense_linear_pack_a(qk_plan, q_group_rows, tm, eff_q, head_width * sizeof(float), pa.data());
-            eff_q = pa.data();
-        }
-        dense_linear_run_tiles(qk_plan, q_group_rows, ta, tm, eff_q, head_width * sizeof(float), packed_k.data(),
-                               nullptr, scores.data(), keys, 0, qk_plan.blocks_n);
-        if (params.scale != 1.0f) {
-            for (float& s : scores) s *= params.scale;
-        }
-#endif
 
         const auto mask_and_softmax = [&](size_t row_begin, size_t row_end) {
             for (size_t row_idx = row_begin; row_idx < row_end; ++row_idx) {
@@ -618,31 +533,28 @@ void attention_prefill_f32(const attention_f32_params& params, const float* quer
             });
         }
 
-#if defined(__APPLE__)
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(q_group_rows),
-                    static_cast<int>(head_width), static_cast<int>(keys), 1.0f, scores.data(), static_cast<int>(keys),
-                    v_mat, static_cast<int>(head_width), 0.0f, out_buf.data(), static_cast<int>(head_width));
-#else
-        dense_linear_plan pv_plan{};
-        if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, head_width, keys, &pv_plan) !=
-            ynn_status_success) {
-            return;
+        if (!detail::arch_sgemm_f32(false, q_group_rows, head_width, keys, 1.0f, scores.data(), keys, v_mat, head_width,
+                                    out_buf.data(), head_width)) {
+            dense_linear_plan pv_plan{};
+            if (make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, head_width, keys, &pv_plan) !=
+                ynn_status_success) {
+                return;
+            }
+            aligned_byte_buffer packed_v(pv_plan.total_bytes);
+            pack_dense_linear_tiles(pv_plan, false, v_mat, head_width * sizeof(float), 0, pv_plan.blocks_n,
+                                    packed_v.data());
+            bool ta2 = false;
+            size_t tm2 = 1, ab2 = 0;
+            dense_linear_select_kernel(pv_plan, q_group_rows, &ta2, &tm2, &ab2);
+            aligned_byte_buffer pa2(ab2);
+            const void* eff_p = scores.data();
+            if (ta2) {
+                dense_linear_pack_a(pv_plan, q_group_rows, tm2, eff_p, keys * sizeof(float), pa2.data());
+                eff_p = pa2.data();
+            }
+            dense_linear_run_tiles(pv_plan, q_group_rows, ta2, tm2, eff_p, keys * sizeof(float), packed_v.data(),
+                                   nullptr, out_buf.data(), head_width, 0, pv_plan.blocks_n);
         }
-        aligned_byte_buffer packed_v(pv_plan.total_bytes);
-        pack_dense_linear_tiles(pv_plan, false, v_mat, head_width * sizeof(float), 0, pv_plan.blocks_n,
-                                packed_v.data());
-        bool ta2 = false;
-        size_t tm2 = 1, ab2 = 0;
-        dense_linear_select_kernel(pv_plan, q_group_rows, &ta2, &tm2, &ab2);
-        aligned_byte_buffer pa2(ab2);
-        const void* eff_p = scores.data();
-        if (ta2) {
-            dense_linear_pack_a(pv_plan, q_group_rows, tm2, eff_p, keys * sizeof(float), pa2.data());
-            eff_p = pa2.data();
-        }
-        dense_linear_run_tiles(pv_plan, q_group_rows, ta2, tm2, eff_p, keys * sizeof(float), packed_v.data(), nullptr,
-                               out_buf.data(), head_width, 0, pv_plan.blocks_n);
-#endif
 
         float* out_dst = output_data + sample * rows * width + first_q_head * head_width;
         for (size_t gh = 0; gh < group_size; ++gh) {

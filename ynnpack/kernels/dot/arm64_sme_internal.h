@@ -79,6 +79,7 @@ YNN_ALWAYS_INLINE svbool_t svptrue(int8_t) YNN_SME_HELPER {
   return svptrue_b8();
 }
 
+#ifdef __ARM_FEATURE_SME2
 YNN_ALWAYS_INLINE svcount_t svctrue(float) YNN_SME_HELPER {
   return svptrue_c32();
 }
@@ -94,6 +95,7 @@ YNN_ALWAYS_INLINE svcount_t svctrue(float16_t) YNN_SME_HELPER {
 YNN_ALWAYS_INLINE svcount_t svctrue(int8_t) YNN_SME_HELPER {
   return svptrue_c8();
 }
+#endif  // __ARM_FEATURE_SME2
 
 }  // namespace ynn
 

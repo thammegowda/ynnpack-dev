@@ -8,14 +8,11 @@
 #include <limits>
 #include <type_traits>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
 #include "ynnpack/base/bfloat16.h"
 #include "ynnpack/base/fp8.h"
 #include "ynnpack/base/half.h"
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/composites/composites_internal.h"
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/kernels/unary/unary.h"
 
@@ -93,6 +90,10 @@ void layer_norm_f32(size_t rows, size_t width, float epsilon, const float* input
                     size_t row_start, size_t row_end) {
     row_end = std::min(row_end, rows);
     if (width == 0 || row_start >= row_end) return;
+    if (detail::arch_layer_norm_f32(rows, width, epsilon, input, residual_in, weight, bias, output_norm,
+                                    output_residual, row_start, row_end)) {
+        return;
+    }
     const float inv_width = 1.0f / static_cast<float>(width);
 
     for (size_t r = row_start; r < row_end; ++r) {
@@ -102,82 +103,26 @@ void layer_norm_f32(size_t rows, size_t width, float epsilon, const float* input
         float* y_res = output_residual != nullptr ? output_residual + r * width : nullptr;
 
         float sum = 0.0f;
-#if defined(__ARM_NEON)
-        float32x4_t vsum = vdupq_n_f32(0.0f);
-        size_t i = 0;
-        if (res != nullptr) {
-            for (; i + 4 <= width; i += 4) {
-                const float32x4_t v = vaddq_f32(vld1q_f32(x + i), vld1q_f32(res + i));
-                if (y_res != nullptr) vst1q_f32(y_res + i, v);
-                vsum = vaddq_f32(vsum, v);
-            }
-            sum = vaddvq_f32(vsum);
-            for (; i < width; ++i) {
-                const float v = x[i] + res[i];
-                if (y_res != nullptr) y_res[i] = v;
-                sum += v;
-            }
-        } else {
-            for (; i + 4 <= width; i += 4) vsum = vaddq_f32(vsum, vld1q_f32(x + i));
-            sum = vaddvq_f32(vsum);
-            for (; i < width; ++i) sum += x[i];
-        }
-#else
         for (size_t i = 0; i < width; ++i) {
             const float v = res != nullptr ? (x[i] + res[i]) : x[i];
             if (y_res != nullptr) y_res[i] = v;
             sum += v;
         }
-#endif
         const float mean = sum * inv_width;
 
         float var_sum = 0.0f;
         const float* src = y_res != nullptr ? y_res : x;
-#if defined(__ARM_NEON)
-        float32x4_t vvsum = vdupq_n_f32(0.0f);
-        const float32x4_t vmean = vdupq_n_f32(mean);
-        size_t j = 0;
-        for (; j + 4 <= width; j += 4) {
-            const float32x4_t v = res != nullptr && y_res == nullptr ? vaddq_f32(vld1q_f32(x + j), vld1q_f32(res + j))
-                                                                     : vld1q_f32(src + j);
-            const float32x4_t d = vsubq_f32(v, vmean);
-            vvsum = vfmaq_f32(vvsum, d, d);
-        }
-        var_sum = vaddvq_f32(vvsum);
-        for (; j < width; ++j) {
-            const float v = (res != nullptr && y_res == nullptr) ? (x[j] + res[j]) : src[j];
-            const float d = v - mean;
-            var_sum += d * d;
-        }
-#else
         for (size_t j = 0; j < width; ++j) {
             const float v = (res != nullptr && y_res == nullptr) ? (x[j] + res[j]) : src[j];
             const float d = v - mean;
             var_sum += d * d;
         }
-#endif
         const float inv_std = 1.0f / std::sqrt(var_sum * inv_width + epsilon);
 
-#if defined(__ARM_NEON)
-        const float32x4_t vinv = vdupq_n_f32(inv_std);
-        size_t k = 0;
-        for (; k + 4 <= width; k += 4) {
-            const float32x4_t v = res != nullptr && y_res == nullptr ? vaddq_f32(vld1q_f32(x + k), vld1q_f32(res + k))
-                                                                     : vld1q_f32(src + k);
-            const float32x4_t norm = vmulq_f32(vsubq_f32(v, vmean), vinv);
-            const float32x4_t scaled = vfmaq_f32(vld1q_f32(bias + k), norm, vld1q_f32(weight + k));
-            vst1q_f32(y + k, scaled);
-        }
-        for (; k < width; ++k) {
-            const float v = (res != nullptr && y_res == nullptr) ? (x[k] + res[k]) : src[k];
-            y[k] = (v - mean) * inv_std * weight[k] + bias[k];
-        }
-#else
         for (size_t k = 0; k < width; ++k) {
             const float v = (res != nullptr && y_res == nullptr) ? (x[k] + res[k]) : src[k];
             y[k] = (v - mean) * inv_std * weight[k] + bias[k];
         }
-#endif
     }
 }
 
@@ -185,21 +130,15 @@ void softmax_f32(size_t rows, size_t width, bool logarithmic, const float* input
                  size_t row_end) {
     row_end = std::min(row_end, rows);
     if (width == 0 || row_start >= row_end) return;
+    if (detail::arch_softmax_f32(rows, width, logarithmic, input, output, row_start, row_end)) return;
 
     for (size_t r = row_start; r < row_end; ++r) {
         const float* x = input + r * width;
         float* y = output + r * width;
 
         float max_val = -std::numeric_limits<float>::infinity();
-#if defined(__ARM_NEON)
-        float32x4_t vmax = vdupq_n_f32(-std::numeric_limits<float>::infinity());
-        size_t i = 0;
-        for (; i + 4 <= width; i += 4) vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
-        max_val = vmaxvq_f32(vmax);
-        for (; i < width; ++i) max_val = std::max(max_val, x[i]);
-#else
         for (size_t i = 0; i < width; ++i) max_val = std::max(max_val, x[i]);
-#endif
+
         float sum_exp = 0.0f;
         for (size_t j = 0; j < width; ++j) {
             const float e = std::exp(x[j] - max_val);
@@ -211,14 +150,7 @@ void softmax_f32(size_t rows, size_t width, bool logarithmic, const float* input
             for (size_t j = 0; j < width; ++j) y[j] = x[j] - log_z;
         } else {
             const float inv_sum = 1.0f / sum_exp;
-#if defined(__ARM_NEON)
-            const float32x4_t vinv = vdupq_n_f32(inv_sum);
-            size_t j = 0;
-            for (; j + 4 <= width; j += 4) vst1q_f32(y + j, vmulq_f32(vld1q_f32(y + j), vinv));
-            for (; j < width; ++j) y[j] *= inv_sum;
-#else
             for (size_t j = 0; j < width; ++j) y[j] *= inv_sum;
-#endif
         }
     }
 }
@@ -238,9 +170,7 @@ void gelu_f32(size_t count, bool approximate, const float* input, float* output,
             float* y = output + offset;
             if (tanh_kernel) {
                 {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+                    YNN_DISABLE_FP_CONTRACT
                     for (size_t i = 0; i < n; ++i) {
                         const float v = x[i];
                         inner_buf[i] = (v + (v * v * v) * 0.044715f) * kSqrt2OverPi;
@@ -248,9 +178,7 @@ void gelu_f32(size_t count, bool approximate, const float* input, float* output,
                 }
                 tanh_kernel(1, n, n * sizeof(float), inner_buf, n * sizeof(float), inner_buf, &tanh_params);
                 {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+                    YNN_DISABLE_FP_CONTRACT
                     for (size_t i = 0; i < n; ++i) y[i] = (x[i] * 0.5f) * (1.0f + inner_buf[i]);
                 }
             } else {
@@ -362,49 +290,17 @@ void broadcast_binary_f32(bool is_multiply, size_t rank, const size_t* out_shape
         const float* bp = b + b_base + inner_start * sb;
         float* op = out + idx;
 
+        size_t i = detail::arch_broadcast_binary_inner_f32(is_multiply, chunk, sa, sb, ap, bp, op);
         if (sa == 1 && sb == 1) {
-#if defined(__ARM_NEON)
-            size_t i = 0;
-            if (is_multiply) {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vmulq_f32(vld1q_f32(ap + i), vld1q_f32(bp + i)));
-            } else {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vaddq_f32(vld1q_f32(ap + i), vld1q_f32(bp + i)));
-            }
             for (; i < chunk; ++i) op[i] = is_multiply ? (ap[i] * bp[i]) : (ap[i] + bp[i]);
-#else
-            for (size_t i = 0; i < chunk; ++i) op[i] = is_multiply ? (ap[i] * bp[i]) : (ap[i] + bp[i]);
-#endif
         } else if (sa == 1 && sb == 0) {
             const float bv = *bp;
-#if defined(__ARM_NEON)
-            const float32x4_t vb = vdupq_n_f32(bv);
-            size_t i = 0;
-            if (is_multiply) {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vmulq_f32(vld1q_f32(ap + i), vb));
-            } else {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vaddq_f32(vld1q_f32(ap + i), vb));
-            }
             for (; i < chunk; ++i) op[i] = is_multiply ? (ap[i] * bv) : (ap[i] + bv);
-#else
-            for (size_t i = 0; i < chunk; ++i) op[i] = is_multiply ? (ap[i] * bv) : (ap[i] + bv);
-#endif
         } else if (sa == 0 && sb == 1) {
             const float av = *ap;
-#if defined(__ARM_NEON)
-            const float32x4_t va = vdupq_n_f32(av);
-            size_t i = 0;
-            if (is_multiply) {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vmulq_f32(va, vld1q_f32(bp + i)));
-            } else {
-                for (; i + 4 <= chunk; i += 4) vst1q_f32(op + i, vaddq_f32(va, vld1q_f32(bp + i)));
-            }
             for (; i < chunk; ++i) op[i] = is_multiply ? (av * bp[i]) : (av + bp[i]);
-#else
-            for (size_t i = 0; i < chunk; ++i) op[i] = is_multiply ? (av * bp[i]) : (av + bp[i]);
-#endif
         } else {
-            for (size_t i = 0; i < chunk; ++i)
-                op[i] = is_multiply ? (ap[i * sa] * bp[i * sb]) : (ap[i * sa] + bp[i * sb]);
+            for (; i < chunk; ++i) op[i] = is_multiply ? (ap[i * sa] * bp[i * sb]) : (ap[i * sa] + bp[i * sb]);
         }
         idx += chunk;
     }

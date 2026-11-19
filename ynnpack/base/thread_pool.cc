@@ -268,6 +268,7 @@ void WorkerPool::ScratchBuffer::ensure(std::size_t required_bytes) {
 }
 
 WorkerPool::WorkerPool(int workers) : workers_(std::max(workers, 0)) {
+    (void)get_supported_arch_flags();
     const auto total = total_threads();
     scratches_.resize(total);
     range_slots_ = std::make_unique<RangeSlot[]>(total);
@@ -598,6 +599,25 @@ std::string supported_arch_names() {
         if (!result.empty()) result += ',';
         result += name;
     };
+#ifdef YNN_ARCH_X86
+    append(arch_flag::sse2, "sse2");
+    append(arch_flag::ssse3, "ssse3");
+    append(arch_flag::sse41, "sse41");
+    append(arch_flag::avx, "avx");
+    append(arch_flag::f16c, "f16c");
+    append(arch_flag::avx2, "avx2");
+    append(arch_flag::fma3, "fma3");
+    append(arch_flag::avx512f, "avx512f");
+    append(arch_flag::avx512bw, "avx512bw");
+    append(arch_flag::avx512vl, "avx512vl");
+    append(arch_flag::avx512dq, "avx512dq");
+    append(arch_flag::avx512bf16, "avx512bf16");
+    append(arch_flag::avx512fp16, "avx512fp16");
+    append(arch_flag::avx512vnni, "avx512vnni");
+    append(arch_flag::amxbf16, "amxbf16");
+    append(arch_flag::amxfp16, "amxfp16");
+    append(arch_flag::amxint8, "amxint8");
+#endif
 #ifdef YNN_ARCH_ARM
     append(arch_flag::neon, "neon");
     append(arch_flag::neonfma, "fma");

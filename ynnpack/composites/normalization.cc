@@ -8,91 +8,52 @@
 #include <cstddef>
 #include <cstdint>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/composites/composites_internal.h"
 #include "ynnpack/include/ynnpack.h"
 
 namespace ynn {
 
 void rms_norm_f32(size_t rows, size_t width, float epsilon, const float* input, const float* weight,
                   const float* residual, bool has_scale, float scale, float* output, size_t row_start, size_t row_end) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+    YNN_DISABLE_FP_CONTRACT
     row_end = std::min(row_end, rows);
+    if (detail::arch_rms_norm_f32(rows, width, epsilon, input, weight, residual, has_scale, scale, output, row_start,
+                                  row_end)) {
+        return;
+    }
     const float reciprocal = 1.0f / static_cast<float>(width);
     for (size_t row = row_start; row < row_end; ++row) {
         const float* x = input + row * width;
         float* y = output + row * width;
         size_t index = 0;
-#if defined(__ARM_NEON)
-        float32x4_t p0 = vdupq_n_f32(0.0f);
-        float32x4_t p1 = vdupq_n_f32(0.0f);
-        for (; index + 8 <= width; index += 8) {
-            const float32x4_t x0 = vld1q_f32(x + index);
-            const float32x4_t x1 = vld1q_f32(x + index + 4);
-            p0 = vaddq_f32(p0, vmulq_f32(x0, x0));
-            p1 = vaddq_f32(p1, vmulq_f32(x1, x1));
-        }
-        float partial[8];
-        vst1q_f32(partial, p0);
-        vst1q_f32(partial + 4, p1);
-#else
         float partial[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (; index + 8 <= width; index += 8) {
             for (size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
         }
-#endif
         float sum = 0.0f;
         for (; index < width; ++index) sum += x[index] * x[index];
         for (size_t lane = 0; lane < 8; ++lane) sum += partial[lane];
         const float inverse = 1.0f / std::sqrt(sum * reciprocal + epsilon);
         if (residual == nullptr) {
-            index = 0;
-#if defined(__ARM_NEON)
-            const float32x4_t vinv = vdupq_n_f32(inverse);
-            for (; index + 8 <= width; index += 8) {
-                vst1q_f32(y + index, vmulq_f32(vmulq_f32(vld1q_f32(x + index), vinv), vld1q_f32(weight + index)));
-                vst1q_f32(y + index + 4,
-                          vmulq_f32(vmulq_f32(vld1q_f32(x + index + 4), vinv), vld1q_f32(weight + index + 4)));
-            }
-#endif
-            for (; index < width; ++index) y[index] = x[index] * inverse * weight[index];
+            for (size_t col = 0; col < width; ++col) y[col] = x[col] * inverse * weight[col];
             continue;
         }
         const float* r = residual + row * width;
-        index = 0;
-#if defined(__ARM_NEON)
-        const float32x4_t vinv = vdupq_n_f32(inverse);
-        const float32x4_t vscale = vdupq_n_f32(scale);
-        for (; index + 8 <= width; index += 8) {
-            float32x4_t v0 = vaddq_f32(vld1q_f32(r + index),
-                                       vmulq_f32(vmulq_f32(vld1q_f32(x + index), vinv), vld1q_f32(weight + index)));
-            float32x4_t v1 = vaddq_f32(vld1q_f32(r + index + 4), vmulq_f32(vmulq_f32(vld1q_f32(x + index + 4), vinv),
-                                                                           vld1q_f32(weight + index + 4)));
-            if (has_scale) {
-                v0 = vmulq_f32(v0, vscale);
-                v1 = vmulq_f32(v1, vscale);
-            }
-            vst1q_f32(y + index, v0);
-            vst1q_f32(y + index + 4, v1);
-        }
-#endif
-        for (; index < width; ++index) {
-            const float value = r[index] + x[index] * inverse * weight[index];
-            y[index] = has_scale ? value * scale : value;
+        for (size_t col = 0; col < width; ++col) {
+            const float value = r[col] + x[col] * inverse * weight[col];
+            y[col] = has_scale ? value * scale : value;
         }
     }
 }
 
 void rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool shared_angles, const float* input,
                 const float* cosine, const float* sine, float* output, size_t row_start, size_t row_end) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+    YNN_DISABLE_FP_CONTRACT
+    if (detail::arch_rotary_f32(sequence_rows, heads, width, shared_angles, input, cosine, sine, output, row_start,
+                                row_end)) {
+        return;
+    }
     const size_t half = width / 2;
     for (size_t row = row_start; row < row_end; ++row) {
         const size_t angle = (shared_angles ? row % sequence_rows : row) * half;
@@ -101,18 +62,7 @@ void rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool shared_an
         for (size_t head = 0; head < heads; ++head) {
             const float* x = input + (row * heads + head) * width;
             float* y = output + (row * heads + head) * width;
-            size_t index = 0;
-#if defined(__ARM_NEON)
-            for (; index + 4 <= half; index += 4) {
-                const float32x4_t first = vld1q_f32(x + index);
-                const float32x4_t second = vld1q_f32(x + index + half);
-                const float32x4_t vc = vld1q_f32(c + index);
-                const float32x4_t vs = vld1q_f32(s + index);
-                vst1q_f32(y + index, vsubq_f32(vmulq_f32(first, vc), vmulq_f32(second, vs)));
-                vst1q_f32(y + index + half, vaddq_f32(vmulq_f32(second, vc), vmulq_f32(first, vs)));
-            }
-#endif
-            for (; index < half; ++index) {
+            for (size_t index = 0; index < half; ++index) {
                 const float first = x[index];
                 const float second = x[index + half];
                 y[index] = first * c[index] - second * s[index];
@@ -126,9 +76,12 @@ void rms_rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool slice
                     size_t input_stride, size_t sequence_offset, size_t channel_offset, float epsilon,
                     bool shared_angles, const float* input, const float* weight, const float* cosine, const float* sine,
                     float* output, size_t vec_start, size_t vec_end) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+    YNN_DISABLE_FP_CONTRACT
+    if (detail::arch_rms_rotary_f32(sequence_rows, heads, width, sliced, input_rows, input_stride, sequence_offset,
+                                    channel_offset, epsilon, shared_angles, input, weight, cosine, sine, output,
+                                    vec_start, vec_end)) {
+        return;
+    }
     const size_t half = width / 2;
     const float reciprocal = 1.0f / static_cast<float>(width);
     for (size_t vector = vec_start; vector < vec_end; ++vector) {
@@ -140,24 +93,10 @@ void rms_rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool slice
                                 : input + vector * width;
         float* y = output + vector * width;
         size_t index = 0;
-#if defined(__ARM_NEON)
-        float32x4_t p0 = vdupq_n_f32(0.0f);
-        float32x4_t p1 = vdupq_n_f32(0.0f);
-        for (; index + 8 <= width; index += 8) {
-            const float32x4_t x0 = vld1q_f32(x + index);
-            const float32x4_t x1 = vld1q_f32(x + index + 4);
-            p0 = vaddq_f32(p0, vmulq_f32(x0, x0));
-            p1 = vaddq_f32(p1, vmulq_f32(x1, x1));
-        }
-        float partial[8];
-        vst1q_f32(partial, p0);
-        vst1q_f32(partial + 4, p1);
-#else
         float partial[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (; index + 8 <= width; index += 8) {
             for (size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
         }
-#endif
         float sum = 0.0f;
         for (; index < width; ++index) sum += x[index] * x[index];
         for (size_t lane = 0; lane < 8; ++lane) sum += partial[lane];
@@ -165,24 +104,11 @@ void rms_rotary_f32(size_t sequence_rows, size_t heads, size_t width, bool slice
         const size_t angle = (shared_angles ? position : sample * sequence_rows + position) * half;
         const float* c = cosine + angle;
         const float* s = sine + angle;
-        index = 0;
-#if defined(__ARM_NEON)
-        const float32x4_t vinv = vdupq_n_f32(inverse);
-        for (; index + 4 <= half; index += 4) {
-            const float32x4_t first = vmulq_f32(vmulq_f32(vld1q_f32(x + index), vinv), vld1q_f32(weight + index));
-            const float32x4_t second =
-                vmulq_f32(vmulq_f32(vld1q_f32(x + index + half), vinv), vld1q_f32(weight + index + half));
-            const float32x4_t vc = vld1q_f32(c + index);
-            const float32x4_t vs = vld1q_f32(s + index);
-            vst1q_f32(y + index, vsubq_f32(vmulq_f32(first, vc), vmulq_f32(second, vs)));
-            vst1q_f32(y + index + half, vaddq_f32(vmulq_f32(second, vc), vmulq_f32(first, vs)));
-        }
-#endif
-        for (; index < half; ++index) {
-            const float first = x[index] * inverse * weight[index];
-            const float second = x[index + half] * inverse * weight[index + half];
-            y[index] = first * c[index] - second * s[index];
-            y[index + half] = second * c[index] + first * s[index];
+        for (size_t col = 0; col < half; ++col) {
+            const float first = x[col] * inverse * weight[col];
+            const float second = x[col + half] * inverse * weight[col + half];
+            y[col] = first * c[col] - second * s[col];
+            y[col + half] = second * c[col] + first * s[col];
         }
     }
 }

@@ -138,13 +138,16 @@ IF(YNN_ENABLE_ARM64)
     CHECK_CXX_SOURCE_COMPILES("${SOURCE}" ${RESULT})
     CMAKE_POP_CHECK_STATE()
   ENDFUNCTION()
-  FUNCTION(YNN_CHECK_SME_COMPILER ARCH FEATURE RESULT)
+  FUNCTION(YNN_CHECK_SME_COMPILER ARCH FEATURE EXTRA_BODY RESULT)
     YNN_CHECK_ARM64_COMPILER(${ARCH} "
       #include <arm_sme.h>
       #if !defined(${FEATURE}) || (defined(__APPLE__) && defined(__clang__) && __clang_major__ < 17)
       #error Unsupported SME compiler
       #endif
-      __arm_new(\"za\") __arm_locally_streaming void check_sme() { svzero_za(); }
+      __arm_new(\"za\") __arm_locally_streaming void check_sme() {
+        svzero_za();
+        ${EXTRA_BODY}
+      }
     " ${RESULT})
   ENDFUNCTION()
   IF(YNN_ENABLE_ARM64_NEON)
@@ -173,8 +176,8 @@ IF(YNN_ENABLE_ARM64)
     ENDIF()
   ENDIF()
   IF(NOT WIN32)
-    YNN_CHECK_SME_COMPILER(arm64_sme __ARM_FEATURE_SME YNN_COMPILER_HAS_SME)
-    YNN_CHECK_SME_COMPILER(arm64_sme2 __ARM_FEATURE_SME2 YNN_COMPILER_HAS_SME2)
+    YNN_CHECK_SME_COMPILER(arm64_sme __ARM_FEATURE_SME "" YNN_COMPILER_HAS_SME)
+    YNN_CHECK_SME_COMPILER(arm64_sme2 __ARM_FEATURE_SME2 "svcount_t c = svptrue_c32(); (void)c;" YNN_COMPILER_HAS_SME2)
     SET(YNN_ARM64_SME_DEFAULT ${YNN_COMPILER_HAS_SME})
     IF(YNN_COMPILER_HAS_SME)
       SET(YNN_ARM64_SME2_DEFAULT ${YNN_COMPILER_HAS_SME2})
