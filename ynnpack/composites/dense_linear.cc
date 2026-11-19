@@ -10,15 +10,12 @@
 #include <optional>
 #include <vector>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
 #include "ynnpack/base/arithmetic.h"
 #include "ynnpack/base/base.h"
 #include "ynnpack/base/bfloat16.h"
 #include "ynnpack/base/type.h"
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/composites/composites_internal.h"
 #include "ynnpack/kernels/dot/dot.h"
 #include "ynnpack/kernels/dot/pack.h"
 #include "ynnpack/kernels/dot/schedule.h"
@@ -30,15 +27,7 @@ namespace {
 constexpr size_t kCacheSizeL2 = 128 * 1024;
 
 inline void f32_to_bf16_slice(const float* src, uint16_t* dst, size_t count) noexcept {
-    size_t i = 0;
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__)) && defined(__ARM_FEATURE_BF16)
-    for (; i + 8 <= count; i += 8) {
-        const float32x4_t v0 = vld1q_f32(src + i);
-        const float32x4_t v1 = vld1q_f32(src + i + 4);
-        vst1q_u16(dst + i, vreinterpretq_u16_bf16(vcombine_bf16(vcvt_bf16_f32(v0), vcvt_bf16_f32(v1))));
-    }
-#endif
-    for (; i < count; ++i) {
+    for (size_t i = detail::arch_f32_to_bf16_slice(src, dst, count); i < count; ++i) {
         uint32_t bits = 0;
         std::memcpy(&bits, src + i, sizeof(bits));
         bits += 0x7FFFu + ((bits >> 16) & 1u);
@@ -47,17 +36,7 @@ inline void f32_to_bf16_slice(const float* src, uint16_t* dst, size_t count) noe
 }
 
 inline void bf16_to_f32_slice(const uint16_t* src, float* dst, size_t count) noexcept {
-    size_t i = 0;
-#if defined(__ARM_NEON)
-    for (; i + 8 <= count; i += 8) {
-        const uint16x8_t v = vld1q_u16(src + i);
-        const uint32x4_t lo = vshlq_n_u32(vmovl_u16(vget_low_u16(v)), 16);
-        const uint32x4_t hi = vshlq_n_u32(vmovl_u16(vget_high_u16(v)), 16);
-        vst1q_f32(dst + i, vreinterpretq_f32_u32(lo));
-        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(hi));
-    }
-#endif
-    for (; i < count; ++i) {
+    for (size_t i = detail::arch_bf16_to_f32_slice(src, dst, count); i < count; ++i) {
         const uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
         std::memcpy(dst + i, &bits, sizeof(float));
     }
@@ -369,26 +348,15 @@ void dense_linear_run_tiles(const dense_linear_plan& plan, size_t m, bool transp
 void quantize_dynamic_int8_rows_f32(size_t rows, size_t k, const float* input, int8_t* quantized, float* scales,
                                     int32_t* zero_points, size_t row_start, size_t row_end) {
     row_end = std::min(row_end, rows);
+    if (detail::arch_quantize_dynamic_int8_rows_f32(rows, k, input, quantized, scales, zero_points, row_start,
+                                                    row_end)) {
+        return;
+    }
     for (size_t row = row_start; row < row_end; ++row) {
         const float* x = input + row * k;
         float rmin = 0.0f;
         float rmax = 0.0f;
-        size_t col = 0;
-#if defined(__ARM_NEON)
-        float32x4_t vmin0 = vdupq_n_f32(0.0f), vmin1 = vdupq_n_f32(0.0f);
-        float32x4_t vmax0 = vdupq_n_f32(0.0f), vmax1 = vdupq_n_f32(0.0f);
-        for (; col + 8 <= k; col += 8) {
-            const float32x4_t x0 = vld1q_f32(x + col);
-            const float32x4_t x1 = vld1q_f32(x + col + 4);
-            vmin0 = vminq_f32(vmin0, x0);
-            vmin1 = vminq_f32(vmin1, x1);
-            vmax0 = vmaxq_f32(vmax0, x0);
-            vmax1 = vmaxq_f32(vmax1, x1);
-        }
-        rmin = vminvq_f32(vminq_f32(vmin0, vmin1));
-        rmax = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
-#endif
-        for (; col < k; ++col) {
+        for (size_t col = 0; col < k; ++col) {
             rmin = std::min(rmin, x[col]);
             rmax = std::max(rmax, x[col]);
         }
@@ -407,21 +375,7 @@ void quantize_dynamic_int8_rows_f32(size_t rows, size_t k, const float* input, i
         scales[row] = scale;
         zero_points[row] = zp;
         int8_t* q = quantized + row * k;
-        col = 0;
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
-        const float32x4_t vinv = vdupq_n_f32(inv_scale);
-        const int32x4_t vzp = vdupq_n_s32(zp);
-        for (; col + 16 <= k; col += 16) {
-            const int32x4_t i0 = vaddq_s32(vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + col + 0), vinv)), vzp);
-            const int32x4_t i1 = vaddq_s32(vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + col + 4), vinv)), vzp);
-            const int32x4_t i2 = vaddq_s32(vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + col + 8), vinv)), vzp);
-            const int32x4_t i3 = vaddq_s32(vcvtaq_s32_f32(vmulq_f32(vld1q_f32(x + col + 12), vinv)), vzp);
-            const int16x8_t s0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
-            const int16x8_t s1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
-            vst1q_s8(q + col, vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1)));
-        }
-#endif
-        for (; col < k; ++col) {
+        for (size_t col = 0; col < k; ++col) {
             const int32_t v = static_cast<int32_t>(std::lround(x[col] * inv_scale)) + zp;
             q[col] = static_cast<int8_t>(std::clamp<int32_t>(v, -128, 127));
         }
@@ -473,17 +427,8 @@ void quantized_linear_run_tiles(const dense_linear_plan& plan, size_t m, bool tr
                 const int32_t a_zp = a_zero_points[m0 + row];
                 const int32_t* acc_row = i32_scratch + row * plan.block_n;
                 float* out_row = output_f32 + (m0 + row) * output_stride_elems + n0;
-                size_t col = 0;
-#if defined(__ARM_NEON)
-                const float32x4_t vas = vdupq_n_f32(a_scale);
-                const int32x4_t vazp = vdupq_n_s32(a_zp);
-                for (; col + 4 <= n_valid; col += 4) {
-                    const int32x4_t corr = vmlsq_s32(vld1q_s32(acc_row + col), vld1q_s32(wsum + col), vazp);
-                    const float32x4_t prod = vmulq_f32(vcvtq_f32_s32(corr), vmulq_f32(vld1q_f32(ws + col), vas));
-                    const float32x4_t res = bp ? vaddq_f32(prod, vld1q_f32(bp + col)) : prod;
-                    vst1q_f32(out_row + col, res);
-                }
-#endif
+                size_t col =
+                    detail::arch_dequantize_i32_row_f32(n_valid, acc_row, wsum, a_scale, a_zp, ws, bp, out_row);
                 for (; col < n_valid; ++col) {
                     const int32_t corr = acc_row[col] - a_zp * wsum[col];
                     const float val = static_cast<float>(corr) * (a_scale * ws[col]);

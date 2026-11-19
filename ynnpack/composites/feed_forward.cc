@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/composites/composites_internal.h"
 #include "ynnpack/include/ynnpack.h"
 #include "ynnpack/kernels/unary/unary.h"
 
@@ -91,9 +92,7 @@ ynn_status gelu_gate_tiles_f32(size_t rows, size_t width, const float* input, fl
         const float* up = gate + width;
         float* hidden = output + row * width + offset;
         {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+            YNN_DISABLE_FP_CONTRACT
             for (size_t i = 0; i < count; ++i) {
                 const float g = gate[i];
                 hidden[i] = (g + (g * g * g) * 0.044715f) * kScale;
@@ -101,9 +100,7 @@ ynn_status gelu_gate_tiles_f32(size_t rows, size_t width, const float* input, fl
         }
         tanh_kernel(1, count, count * sizeof(float), hidden, count * sizeof(float), hidden, &tanh_params);
         {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+            YNN_DISABLE_FP_CONTRACT
             for (size_t i = 0; i < count; ++i) {
                 hidden[i] = ((gate[i] * 0.5f) * (1.0f + hidden[i])) * up[i];
             }
@@ -144,9 +141,7 @@ ynn_status silu_multiply_tiles_f32(size_t elements, const float* gate, const flo
         float* dst = output + offset;
         sigmoid_kernel(1, count, count * sizeof(float), g_ptr, count * sizeof(float), sig_buf, &sigmoid_params);
         {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+            YNN_DISABLE_FP_CONTRACT
             for (size_t i = 0; i < count; ++i) {
                 dst[i] = (g_ptr[i] * sig_buf[i]) * u_ptr[i];
             }
@@ -173,9 +168,7 @@ ynn_status gelu_multiply_tiles_f32(size_t elements, const float* gate, const flo
         const float* u_ptr = up + offset;
         float* dst = output + offset;
         {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+            YNN_DISABLE_FP_CONTRACT
             for (size_t i = 0; i < count; ++i) {
                 const float g = g_ptr[i];
                 inner_buf[i] = (g + (g * g * g) * 0.044715f) * kScale;
@@ -183,9 +176,7 @@ ynn_status gelu_multiply_tiles_f32(size_t elements, const float* gate, const flo
         }
         tanh_kernel(1, count, count * sizeof(float), inner_buf, count * sizeof(float), inner_buf, &tanh_params);
         {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+            YNN_DISABLE_FP_CONTRACT
             for (size_t i = 0; i < count; ++i) {
                 dst[i] = ((g_ptr[i] * 0.5f) * (1.0f + inner_buf[i])) * u_ptr[i];
             }
@@ -242,9 +233,7 @@ ynn_status packed_ffn_mid_tiles_f32(int32_t bits, size_t m, size_t input_size, s
 
 void elementwise_binary_f32(bool is_multiply, size_t elements, size_t rhs_stride, const float* lhs, const float* rhs,
                             float* output, size_t start, size_t end) {
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+    YNN_DISABLE_FP_CONTRACT
     end = std::min(end, elements);
     if (start >= end) return;
     if (rhs_stride == 0) {

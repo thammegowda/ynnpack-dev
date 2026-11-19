@@ -320,6 +320,11 @@ float dot_arch_cost_factor(uint64_t arch, uint32_t m, uint32_t n,
   }
 #endif
 #ifdef YNN_ARCH_X86
+  if (arch & (arch_flag::amxbf16 | arch_flag::amxfp16 | arch_flag::amxint8)) {
+    if (m == 1) {
+      return 10.0f;
+    }
+  }
   if (arch & arch_flag::avx512vnni || arch & arch_flag::amxint8) {
     // The VNNI kernels have a smaller unrolling in K than the AVX512 kernels,
     // which tricks `estimate_dot_cost` into thinking the regular AVX512 kernels
