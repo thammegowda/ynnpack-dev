@@ -109,6 +109,7 @@ void drain_range_slots(ParallelRangeSlots& slots, std::size_t tid, std::size_t g
 /// - Deterministic per-worker home-range slots with contention-free ring stealing (`run_ranges`).
 /// - Single-dispatch multi-phase team execution (`run_team` + `PhaseBarrier`) so multi-stage ops synchronize in L1/L2
 ///   without re-entering the thread pool.
+/// - Lock-free fork/join: one published cache line per dispatch and per-worker completion flags.
 /// - Hardware-timed `yield` spinning + C++20 `std::atomic::wait` (`ulock`/`futex`) parking with zero mutex wakeups.
 class WorkerPool final {
 public:
@@ -152,30 +153,50 @@ private:
         std::size_t steal_grain = 1;
     };
 
-    void execute_team_member(std::size_t tid) noexcept;
+    struct RangePayload {
+        RangeSlot* slots = nullptr;
+        void* user_ctx = nullptr;
+        RangeFn user_fn = nullptr;
+    };
+
+    // Everything a worker needs to join a dispatch shares one cache line and is published by the release store of
+    // `token` ((seq << 16) | team size), so joining costs a single cache miss. The caller rewrites the line only after
+    // every member has reported done.
+    struct alignas(CACHE_LINE_BYTES) TeamLine {
+        std::atomic<std::uint64_t> token = 0;
+        TeamFn fn = nullptr;
+        void* ctx = nullptr;
+        std::size_t scratch_bytes = 0;
+        RangePayload range;
+    };
+
+    // Each worker reports completion on its own line, so the join has no shared read-modify-write.
+    struct alignas(CACHE_LINE_BYTES) DoneSlot {
+        std::atomic<std::uint64_t> seq = 0;
+    };
+
+    void dispatch(std::size_t team_size, TeamFn fn, void* context, std::size_t scratch_bytes);
+    void execute_team_member(std::size_t tid, std::size_t team_size) noexcept;
     void record_exception(std::exception_ptr error) noexcept;
     void worker_main(std::size_t tid);
-    void idle_worker(std::uint64_t seen);
+    void idle_worker(std::uint64_t seen, std::uint64_t last_team_seq);
 
     int workers_;
     std::vector<std::thread> threads_;
     std::vector<ScratchBuffer> scratches_;
     std::unique_ptr<RangeSlot[]> range_slots_;
+    std::unique_ptr<DoneSlot[]> done_;
     std::atomic<bool> stop_ = false;
 
     alignas(CACHE_LINE_BYTES) SpinLock caller_lock_;
     std::uint64_t team_seq_ = 0;
-    std::size_t active_team_size_ = 0;
-    TeamFn team_fn_ = nullptr;
-    void* team_ctx_ = nullptr;
-    std::size_t team_scratch_bytes_ = 0;
     SpinLock error_lock_;
     std::exception_ptr team_error_;
     PhaseBarrier team_barrier_;
 
-    alignas(CACHE_LINE_BYTES) std::atomic<std::uint64_t> team_id_ = 0;
-    alignas(CACHE_LINE_BYTES) std::atomic<std::size_t> team_remaining_ = 0;
+    TeamLine team_;
 
+    // Bumped only to wake parked workers; spinning workers watch `team_.token`.
     alignas(CACHE_LINE_BYTES) std::atomic<std::uint64_t> event_seq_ = 0;
     alignas(CACHE_LINE_BYTES) std::atomic<int> sleeping_ = 0;
 };
