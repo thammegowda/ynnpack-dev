@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -26,7 +27,6 @@ namespace {
 constexpr int LOCK_PAUSES = 128;
 constexpr int BARRIER_PAUSES = 4096;
 constexpr std::uint64_t SPIN_MICROSECONDS = 180;
-constexpr int X86_SPIN_PAUSES = 4096;
 constexpr int GENERIC_SPIN_YIELDS = 64;
 
 inline void cpu_relax() noexcept {
@@ -69,10 +69,14 @@ bool spin_until_ready(Ready&& ready) noexcept {
         }
     } while (arm_counter_ticks() - start < budget);
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-    for (int i = 0; i < X86_SPIN_PAUSES; ++i) {
-        if (ready()) return true;
-        _mm_pause();
-    }
+    // PAUSE latency varies ~10x across x86 generations, so bound the spin by time rather than a pause count.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(SPIN_MICROSECONDS);
+    do {
+        for (int i = 0; i < 64; ++i) {
+            if (ready()) return true;
+            _mm_pause();
+        }
+    } while (std::chrono::steady_clock::now() < deadline);
 #else
     for (int i = 0; i < GENERIC_SPIN_YIELDS; ++i) {
         if (ready()) return true;
@@ -272,6 +276,7 @@ WorkerPool::WorkerPool(int workers) : workers_(std::max(workers, 0)) {
     const auto total = total_threads();
     scratches_.resize(total);
     range_slots_ = std::make_unique<RangeSlot[]>(total);
+    done_ = std::make_unique<DoneSlot[]>(total);
     threads_.reserve(static_cast<std::size_t>(workers_));
     for (int i = 0; i < workers_; ++i) {
         const auto tid = static_cast<std::size_t>(i + 1);
@@ -294,16 +299,16 @@ void WorkerPool::record_exception(std::exception_ptr error) noexcept {
     team_barrier_.abort();
 }
 
-void WorkerPool::execute_team_member(std::size_t tid) noexcept {
+void WorkerPool::execute_team_member(std::size_t tid, std::size_t team_size) noexcept {
     const ActiveTeamScope scope(this);
     const WorkerContext worker{
         .tid = tid,
-        .thread_count = active_team_size_,
-        .scratch = team_scratch_bytes_ > 0 ? scratches_[tid].data : nullptr,
-        .scratch_size = team_scratch_bytes_,
+        .thread_count = team_size,
+        .scratch = team_.scratch_bytes > 0 ? scratches_[tid].data : nullptr,
+        .scratch_size = team_.scratch_bytes,
     };
     try {
-        team_fn_(team_ctx_, worker, team_barrier_);
+        team_.fn(team_.ctx, worker, team_barrier_);
     } catch (...) {
         record_exception(std::current_exception());
     }
@@ -332,28 +337,34 @@ void WorkerPool::run_team(std::size_t max_threads, std::size_t scratch_bytes, vo
         for (std::size_t t = 0; t < team_size; ++t) scratches_[t].ensure(scratch_bytes);
     }
 
-    active_team_size_ = team_size;
-    team_fn_ = fn;
-    team_ctx_ = context;
-    team_scratch_bytes_ = scratch_bytes;
-    team_error_ = nullptr;
     team_barrier_.reset(team_size);
-    team_remaining_.store(team_size - 1, std::memory_order_relaxed);
+    dispatch(team_size, fn, context, scratch_bytes);
+}
 
-    const auto token = ((++team_seq_) << 16) | static_cast<std::uint64_t>(team_size);
-    team_id_.store(token, std::memory_order_release);
-    event_seq_.fetch_add(1, std::memory_order_seq_cst);
+void WorkerPool::dispatch(std::size_t team_size, TeamFn fn, void* context, std::size_t scratch_bytes) {
+    team_.fn = fn;
+    team_.ctx = context;
+    team_.scratch_bytes = scratch_bytes;
+    team_error_ = nullptr;
+
+    const auto seq = ++team_seq_;
+    // seq_cst pairs with the parking protocol in `idle_worker`: either a parking worker sees the new token, or this
+    // thread sees it in `sleeping_` and wakes it.
+    team_.token.store((seq << 16) | static_cast<std::uint64_t>(team_size), std::memory_order_seq_cst);
     if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+        event_seq_.fetch_add(1, std::memory_order_seq_cst);
         event_seq_.notify_all();
     }
 
-    execute_team_member(0);
+    execute_team_member(0, team_size);
 
-    if (team_remaining_.load(std::memory_order_acquire) != 0) {
-        while (!spin_until_ready([&] { return team_remaining_.load(std::memory_order_acquire) == 0; })) {
-            std::this_thread::yield();
-        }
-    }
+    // One branch-free pass over all flags lets their cache misses overlap.
+    const auto joined = [&] {
+        bool all = true;
+        for (std::size_t tid = 1; tid < team_size; ++tid) all &= done_[tid].seq.load(std::memory_order_acquire) == seq;
+        return all;
+    };
+    while (!spin_until_ready(joined)) std::this_thread::yield();
 
     auto error = std::move(team_error_);
     if (error) std::rethrow_exception(error);
@@ -400,11 +411,7 @@ void WorkerPool::run_ranges(std::size_t items, std::size_t min_grain, std::size_
         cursor = end;
     }
 
-    struct RangePayload {
-        RangeSlot* slots;
-        void* user_ctx;
-        RangeFn user_fn;
-    } payload{range_slots_.get(), context, fn};
+    team_.range = {range_slots_.get(), context, fn};
 
     const TeamFn runner = [](void* raw, const WorkerContext& worker, PhaseBarrier& barrier) {
         const auto p = *static_cast<const RangePayload*>(raw);
@@ -428,31 +435,10 @@ void WorkerPool::run_ranges(std::size_t items, std::size_t min_grain, std::size_
         }
     };
 
-    active_team_size_ = team_size;
-    team_fn_ = runner;
-    team_ctx_ = &payload;
-    team_scratch_bytes_ = scratch_bytes;
-    team_error_ = nullptr;
-    team_barrier_.reset(team_size);
-    team_remaining_.store(team_size - 1, std::memory_order_relaxed);
-
-    const auto token = ((++team_seq_) << 16) | static_cast<std::uint64_t>(team_size);
-    team_id_.store(token, std::memory_order_release);
-    event_seq_.fetch_add(1, std::memory_order_seq_cst);
-    if (sleeping_.load(std::memory_order_seq_cst) > 0) {
-        event_seq_.notify_all();
-    }
-
-    execute_team_member(0);
-
-    if (team_remaining_.load(std::memory_order_acquire) != 0) {
-        while (!spin_until_ready([&] { return team_remaining_.load(std::memory_order_acquire) == 0; })) {
-            std::this_thread::yield();
-        }
-    }
-
-    auto error = std::move(team_error_);
-    if (error) std::rethrow_exception(error);
+    // Only an exception aborts the barrier; ranges never wait on it, so skip the reset (and its cache-line writes)
+    // otherwise.
+    if (team_barrier_.aborted()) team_barrier_.reset(team_size);
+    dispatch(team_size, runner, &team_.range, scratch_bytes);
 }
 
 void WorkerPool::run_tasks(std::size_t n, void* context, TaskFn fn) {
@@ -486,26 +472,28 @@ void WorkerPool::worker_main(std::size_t tid) {
         const auto seen = event_seq_.load(std::memory_order_acquire);
         if (stop_.load(std::memory_order_acquire)) break;
 
-        const auto cur_token = team_id_.load(std::memory_order_acquire);
-        const auto cur_seq = cur_token >> 16;
-        if (cur_seq != last_team_seq) {
-            last_team_seq = cur_seq;
-            const auto tok_team_size = static_cast<std::size_t>(cur_token & 0xFFFFu);
-            if (tid < tok_team_size) {
-                execute_team_member(tid);
-                team_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+        const auto token = team_.token.load(std::memory_order_acquire);
+        const auto seq = token >> 16;
+        if (seq != last_team_seq) {
+            last_team_seq = seq;
+            const auto team_size = static_cast<std::size_t>(token & 0xFFFFu);
+            if (tid < team_size) {
+                execute_team_member(tid, team_size);
+                done_[tid].seq.store(seq, std::memory_order_release);
                 continue;
             }
         }
 
-        idle_worker(seen);
+        idle_worker(seen, last_team_seq);
     }
 }
 
-void WorkerPool::idle_worker(std::uint64_t seen) {
-    if (spin_until_ready([&] { return event_seq_.load(std::memory_order_acquire) != seen; })) return;
+void WorkerPool::idle_worker(std::uint64_t seen, std::uint64_t last_team_seq) {
+    const auto fresh = [&] { return (team_.token.load(std::memory_order_acquire) >> 16) != last_team_seq; };
+    if (spin_until_ready(fresh)) return;
     sleeping_.fetch_add(1, std::memory_order_seq_cst);
-    if (event_seq_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_acquire)) {
+    if ((team_.token.load(std::memory_order_seq_cst) >> 16) == last_team_seq &&
+        event_seq_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_acquire)) {
         event_seq_.wait(seen, std::memory_order_acquire);
     }
     sleeping_.fetch_sub(1, std::memory_order_relaxed);

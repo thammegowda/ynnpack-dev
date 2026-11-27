@@ -11,6 +11,7 @@
 #include <new>
 
 #include "ynnpack/composites/hnsw.h"
+#include "ynnpack/composites/vq_linear.h"
 #include "ynnpack/include/ynnpack.h"
 
 namespace ynn {

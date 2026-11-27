@@ -14,6 +14,7 @@ SET(YNN_COMPOSITES_SRCS
   hnsw_kernels.cc
   normalization.cc
   tensor_ops.cc
+  vq_linear.cc
 )
 SET(YNN_COMPOSITES_DEFINES)
 
