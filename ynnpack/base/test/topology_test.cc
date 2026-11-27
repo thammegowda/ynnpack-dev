@@ -83,10 +83,6 @@ TEST(TopologyTest, ConfineToNumaNode) {
     };
     std::thread([&] {
         const auto before = affinity();
-        setenv("YNN_NUMA", "off", 1);
-        EXPECT_FALSE(confine_to_numa_node(1).has_value());
-        EXPECT_EQ(affinity(), before);
-        unsetenv("YNN_NUMA");
         const auto node = confine_to_numa_node(1);
         const auto after = affinity();
         EXPECT_FALSE(after.empty());

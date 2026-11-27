@@ -25,16 +25,6 @@ bool parse_cpu_id(std::string_view text, int& value) {
     return status == std::errc{} && end == text.data() + text.size() && value >= 0 && value <= MAX_CPU_ID;
 }
 
-bool env_disabled(const char* primary, const char* fallback) noexcept {
-    for (const char* name : {primary, fallback}) {
-        if (name == nullptr) continue;
-        if (const char* setting = std::getenv(name); setting != nullptr && std::string_view(setting) == "off") {
-            return true;
-        }
-    }
-    return false;
-}
-
 #if defined(__linux__)
 std::vector<CpuCapacity> probe_linux_cpu_capacities() {
     cpu_set_t allowed;
@@ -115,7 +105,6 @@ std::size_t count_performance_cpus(std::span<const CpuCapacity> cpus) {
 std::size_t default_thread_count() noexcept {
     const auto hw = std::max<std::size_t>(1, std::thread::hardware_concurrency());
 #if defined(__linux__)
-    if (env_disabled("YNN_NUMA", "KIDI_NUMA") || env_disabled("YNN_BIG_CORES", "KIDI_BIG_CORES")) return hw;
     try {
         static const std::size_t detected = [] {
             const auto capacities = probe_linux_cpu_capacities();
@@ -153,7 +142,6 @@ std::vector<int> choose_performance_cpus(std::span<const CpuCapacity> cpus, std:
 
 bool confine_to_performance_cpus(std::size_t threads) {
 #if defined(__linux__)
-    if (env_disabled("YNN_NUMA", "KIDI_NUMA") || env_disabled("YNN_BIG_CORES", "KIDI_BIG_CORES")) return false;
     const auto capacities = probe_linux_cpu_capacities();
     const auto chosen = choose_performance_cpus(capacities, threads);
     if (chosen.empty()) return false;
@@ -169,7 +157,6 @@ bool confine_to_performance_cpus(std::size_t threads) {
 
 std::optional<int> confine_to_numa_node(std::size_t threads) {
 #if defined(__linux__) && !defined(__ANDROID__)
-    if (env_disabled("YNN_NUMA", "KIDI_NUMA")) return std::nullopt;
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return std::nullopt;
